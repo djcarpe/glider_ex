@@ -1,0 +1,22 @@
+[package]
+name = "glider_nif"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Rustler NIF bridging the glider graph database to the BEAM."
+
+[lib]
+name = "glider_nif"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.37"
+# glider itself has no dependencies; this crate adds rustler, which is exactly
+# why the bindings live outside the glider tree.
+glider = { path = "../../../glider" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
