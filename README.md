@@ -117,6 +117,23 @@ literal `#{...}` inside a query is not read as interpolation.
     Use `Glider.stats/1` for a count that is always present.
   * `count(DISTINCT x)` is unsupported; `RETURN DISTINCT` works.
 
+## Benchmarks
+
+```sh
+mix bench              # everything
+mix bench queries      # one script
+```
+
+See `bench/README.md` for the measured findings. The three that change how you
+write code against this library:
+
+  * An indexed lookup is flat in graph size; a label scan is linear (~1.5 µs
+    per node). `LIMIT` does not make a scan cheap — the engine materialises the
+    whole label first.
+  * `import_jsonl/2` is ~3x faster than a loop of `CREATE`s.
+  * Sharing one handle across processes gets *slower* with concurrency, not
+    faster. Give each reader its own graph.
+
 ## Layout
 
 ```

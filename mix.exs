@@ -28,14 +28,16 @@ defmodule Glider.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.37"},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:benchee, "~> 1.3", only: [:dev, :bench], runtime: false}
     ]
   end
 
   defp aliases do
     [
       compile: ["compile", &prune_stray_artifacts/1],
-      test: ["compile", &prune_stray_artifacts/1, "test"]
+      test: ["compile", &prune_stray_artifacts/1, "test"],
+      bench: ["compile", &prune_stray_artifacts/1, &run_benchmarks/1]
     ]
   end
 
@@ -54,6 +56,26 @@ defmodule Glider.MixProject do
     end
 
     :ok
+  end
+
+  # `mix bench` runs every script in bench/, or just the ones named:
+  #     mix bench            # all
+  #     mix bench queries    # bench/queries.exs
+  defp run_benchmarks(args) do
+    scripts =
+      case args do
+        [] -> "bench/*.exs" |> Path.wildcard() |> Enum.sort()
+        names -> Enum.map(names, &Path.join("bench", String.trim_trailing(&1, ".exs") <> ".exs"))
+      end
+
+    Enum.each(scripts, fn script ->
+      unless File.exists?(script), do: Mix.raise("no such benchmark: #{script}")
+      Mix.shell().info("\n== #{script} ==")
+      # `mix run` compiles the script; Code.eval_file/1 would interpret it, and
+      # Benchee measures the call itself — an evaluated function adds microseconds
+      # to every scenario, which is a large distortion at this scale.
+      Mix.Task.rerun("run", [script])
+    end)
   end
 
   defp package do
