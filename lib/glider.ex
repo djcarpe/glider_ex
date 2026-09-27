@@ -23,28 +23,58 @@ defmodule Glider do
   form rather than `~s` so that a literal `#{...}` inside a query is not read
   as interpolation.
 
+  ## Parameters
+
+  Pass values as `$name` parameters rather than splicing them into the string.
+  They are substituted as literals, so a value can never change the query's
+  shape:
+
+      Glider.query(db, "MATCH (p:Person {email: $email}) RETURN p", email: email)
+
+  ## Composable queries
+
+  `Glider.Query` builds queries Ecto-style, with `^` pinning Elixir values as
+  parameters:
+
+      import Glider.Query
+
+      match("(p:Person)-[:KNOWS]->(f:Person)")
+      |> where(p.email == ^email and f.age >= ^min_age)
+      |> return(name: f.name, age: f.age)
+      |> order_by(desc: f.age)
+      |> limit(10)
+      |> Glider.all(db)
+      #=> [%{name: "Bob", age: 41}, ...]
+
+  ## Transactions
+
+  Outside a transaction every statement commits on its own. `transaction/2`
+  groups them, and belongs to the calling process: other processes using the
+  same handle wait until it finishes.
+
+      Glider.transaction(db, fn ->
+        Glider.run!(db, "CREATE (:Account {id: $id})", id: 1)
+        Glider.run!(db, "CREATE (:Account {id: $id})", id: 2)
+      end)
+
   ## Concurrency
 
   A handle is safe to share between processes, but calls against one handle are
-  **serialised** by a mutex inside the NIF: glider holds the graph in memory and
-  mutates it in place, so concurrent access would be a data race rather than a
-  slowdown. Reads do not run in parallel.
-
-  If you want a single writer with supervised lifecycle, put the handle in a
-  `GenServer` and call through it. If you want read parallelism, open several
-  handles onto separate graphs — one per shard — rather than sharing one.
+  **serialised** by a mutex inside the NIF. If you want a single writer with a
+  supervised lifecycle, put the handle in a `GenServer` and call through it.
 
   All potentially slow work (queries, algorithms, opening a file, import,
-  export, compaction) runs on a dirty scheduler, so a long-running PageRank
+  export, checkpoints) runs on a dirty scheduler, so a long-running PageRank
   will not stall the VM.
 
   ## Persistence
 
-  `open/0` gives a throwaway in-memory graph. `open/2` opens or creates a file,
-  which is a write-ahead log and the persistent form at once:
+  `open/0` gives a throwaway in-memory graph. `open/2` opens or creates a paged
+  database file, which may grow far beyond RAM; memory stays near the page
+  cache size:
 
       {:ok, db} = Glider.open("social.gldb")
-      {:ok, db} = Glider.open("social.gldb", :always)   # fsync every commit
+      {:ok, db} = Glider.open("social.gldb", sync: :always, cache_size: "256M")
 
   Durability modes are `:always` (survives power loss), `:normal` (the default;
   survives process death) and `:off` (buffered, for bulk load).
@@ -58,7 +88,9 @@ defmodule Glider do
       Use `stats/1` when you want a count that is always present.
   """
 
-  alias Glider.{Native, Node, Rel, Result}
+  import Bitwise
+
+  alias Glider.{Native, Node, Query, Rel, Result}
 
   @typedoc "A property value. glider's values are flat — no nested maps."
   @type prop :: nil | boolean() | integer() | float() | String.t() | [prop()]
@@ -71,30 +103,101 @@ defmodule Glider do
 
   @type sync :: :always | :normal | :off
 
-  @doc "Open a throwaway in-memory graph."
-  @spec open() :: {:ok, db()} | {:error, String.t()}
-  def open, do: {:ok, Native.open_memory()}
+  @typedoc "`$name` parameters, as a keyword list or a map with atom or string keys."
+  @type params :: keyword() | %{optional(atom() | String.t()) => prop()}
+
+  @typedoc "A query string or a `Glider.Query` built with the query DSL."
+  @type queryable :: String.t() | Query.t()
+
+  @typedoc """
+  A size in bytes: an integer, or a string with a K, M, G or T suffix
+  (binary multiples, as the glider CLI takes them).
+  """
+  @type size :: non_neg_integer() | String.t()
 
   @doc """
-  Open or create a graph file.
+  Open a throwaway in-memory graph.
+
+  Options:
+
+    * `:max_memory` - the most memory the graph may use (a `t:size/0`).
+      Past it, writes fail cleanly and roll back. Defaults to physical RAM.
+  """
+  @spec open(keyword()) :: {:ok, db()} | {:error, String.t()}
+  def open(opts \\ [])
+
+  def open(opts) when is_list(opts) do
+    {:ok, Native.open_memory(bytes(Keyword.get(opts, :max_memory, 0)))}
+  end
+
+  def open(path) when is_binary(path), do: open(path, [])
+
+  @doc """
+  Open or create a database file.
+
+  Options:
+
+    * `:sync` - `:always`, `:normal` (default) or `:off`.
+    * `:cache_size` - page cache (a `t:size/0`, default 1G). RAM use stays
+      near this however large the database grows.
+    * `:work_mem` - memory algorithms may use before spilling to disk
+      (default 256M).
+    * `:checkpoint` - fold the write-ahead log into the pages after this much
+      log (default 256M), or `:off`.
+
+  A bare sync atom is accepted in place of the options: `open(path, :always)`.
 
   Returns `{:error, reason}` if the file is locked by another writer, or is not
   a glider database.
   """
-  @spec open(Path.t(), sync()) :: {:ok, db()} | {:error, String.t()}
-  def open(path, sync \\ :normal) when is_binary(path) and sync in [:always, :normal, :off] do
-    Native.open_file(path, sync)
+  @spec open(Path.t(), keyword() | sync()) :: {:ok, db()} | {:error, String.t()}
+  def open(path, sync) when is_binary(path) and sync in [:always, :normal, :off],
+    do: open(path, sync: sync)
+
+  def open(path, opts) when is_binary(path) and is_list(opts) do
+    sync = Keyword.get(opts, :sync, :normal)
+
+    unless sync in [:always, :normal, :off] do
+      raise ArgumentError, "unknown :sync mode #{inspect(sync)}"
+    end
+
+    checkpoint =
+      case Keyword.get(opts, :checkpoint, 0) do
+        :off -> 0xFFFF_FFFF_FFFF_FFFF
+        size -> bytes(size)
+      end
+
+    Native.open_file(
+      path,
+      sync,
+      bytes(Keyword.get(opts, :cache_size, 0)),
+      bytes(Keyword.get(opts, :work_mem, 0)),
+      checkpoint
+    )
   end
 
   @doc """
   Run a query.
 
+  `query` is a string or a `Glider.Query`. `params` fill `$name` placeholders;
+  a `Glider.Query` carries its own pinned values and may take more here.
+
   Nodes and relationships come back as `%Glider.Node{}` and `%Glider.Rel{}`;
   everything else as the corresponding Elixir term.
   """
-  @spec query(db(), String.t()) :: {:ok, Result.t()} | {:error, String.t()}
-  def query(db, q) when is_binary(q) do
-    case Native.query(db, q) do
+  @spec query(db(), queryable(), params()) :: {:ok, Result.t()} | {:error, String.t()}
+  def query(db, query, params \\ [])
+
+  # Query first, so a pipeline can end in `|> Glider.query(db)`.
+  def query(%Query{} = q, db, params) when is_reference(db), do: query(db, q, params)
+
+  def query(db, %Query{} = q, params) do
+    {cypher, own} = Query.to_cypher(q)
+    query(db, cypher, Map.merge(own, stringify(params)))
+  end
+
+  def query(db, q, params) when is_binary(q) do
+    case Native.query(db, q, Map.to_list(stringify(params))) do
       {:ok, map} -> {:ok, to_result(map)}
       {:error, reason} -> {:error, reason}
     end
@@ -103,11 +206,14 @@ defmodule Glider do
   @doc """
   Run a query, raising `Glider.Error` on failure.
   """
-  @spec query!(db(), String.t()) :: Result.t()
-  def query!(db, q) do
-    case query(db, q) do
+  @spec query!(db(), queryable(), params()) :: Result.t()
+  def query!(db, q, params \\ [])
+  def query!(%Query{} = q, db, params) when is_reference(db), do: query!(db, q, params)
+
+  def query!(db, q, params) do
+    case query(db, q, params) do
       {:ok, r} -> r
-      {:error, reason} -> raise Glider.Error, message: reason, query: q
+      {:error, reason} -> raise Glider.Error, message: reason, query: describe(q)
     end
   end
 
@@ -116,16 +222,121 @@ defmodule Glider do
 
       {:ok, 3} = Glider.run(db, "CREATE (:A)-[:R]->(:B)")
   """
-  @spec run(db(), String.t()) :: {:ok, non_neg_integer()} | {:error, String.t()}
-  def run(db, q) do
-    with {:ok, r} <- query(db, q), do: {:ok, r.touched}
+  @spec run(db(), queryable(), params()) :: {:ok, non_neg_integer()} | {:error, String.t()}
+  def run(db, q, params \\ [])
+  def run(%Query{} = q, db, params) when is_reference(db), do: run(db, q, params)
+
+  def run(db, q, params) do
+    with {:ok, r} <- query(db, q, params), do: {:ok, r.touched}
+  end
+
+  @doc "Like `run/3`, raising `Glider.Error` on failure."
+  @spec run!(db(), queryable(), params()) :: non_neg_integer()
+  def run!(db, q, params \\ [])
+  def run!(%Query{} = q, db, params) when is_reference(db), do: run!(db, q, params)
+  def run!(db, q, params), do: query!(db, q, params).touched
+
+  @doc """
+  The rows of a query, shaped by its `RETURN`.
+
+  For a `Glider.Query`, rows take the shape its `return/2` asked for: a single
+  expression gives a list of values, a keyword list gives maps, a list gives
+  lists. A query string gives lists, one per row.
+
+      Glider.all(db, "MATCH (p:Person) RETURN p.name")
+      #=> [["Ada"], ["Bob"]]
+  """
+  @spec all(db(), queryable(), params()) :: [term()]
+  def all(db, q, params \\ [])
+  def all(%Query{} = q, db, params) when is_reference(db), do: all(db, q, params)
+
+  def all(db, q, params) do
+    r = query!(db, q, params)
+    Enum.map(r.rows, &shape_row(q, &1))
+  end
+
+  @doc """
+  The single row of a query, `nil` when there is none. Raises if there are
+  several.
+  """
+  @spec one(db(), queryable(), params()) :: term() | nil
+  def one(db, q, params \\ [])
+  def one(%Query{} = q, db, params) when is_reference(db), do: one(db, q, params)
+
+  def one(db, q, params) do
+    case all(db, q, params) do
+      [] -> nil
+      [row] -> row
+      rows -> raise Glider.Error, message: "expected at most one row, got #{length(rows)}", query: describe(q)
+    end
   end
 
   @doc "Just the drawable `%{nodes: [...], edges: [...]}` projection of a query."
-  @spec graph(db(), String.t()) :: {:ok, map()} | {:error, String.t()}
-  def graph(db, q) do
-    with {:ok, r} <- query(db, q), do: {:ok, r.graph}
+  @spec graph(db(), queryable(), params()) :: {:ok, map()} | {:error, String.t()}
+  def graph(db, q, params \\ [])
+  def graph(%Query{} = q, db, params) when is_reference(db), do: graph(db, q, params)
+
+  def graph(db, q, params) do
+    with {:ok, r} <- query(db, q, params), do: {:ok, r.graph}
   end
+
+  @doc """
+  Run `fun` inside a transaction owned by the calling process.
+
+  Commits and returns `{:ok, result}` if `fun` returns normally. Rolls back if
+  it raises, throws or exits (and re-raises), or if it calls `rollback/2`
+  (returning `{:error, value}`). A statement that fails inside the transaction
+  aborts it: the rest of `fun` still runs, but nothing is committed.
+
+  Calling `transaction/2` while the process already holds a transaction on
+  `db` runs `fun` inside it.
+  """
+  @spec transaction(db(), (-> result)) :: {:ok, result} | {:error, term()} when result: term()
+  def transaction(db, fun) when is_function(fun, 0) do
+    if Native.in_transaction(db) do
+      {:ok, fun.()}
+    else
+      with {:ok, :ok} <- Native.begin(db), do: run_transaction(db, fun)
+    end
+  end
+
+  defp run_transaction(db, fun) do
+    result =
+      try do
+        fun.()
+      catch
+        :throw, {:glider_rollback, ^db, value} ->
+          _ = Native.rollback(db)
+          throw({:glider_rolled_back, value})
+
+        kind, reason ->
+          _ = Native.rollback(db)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    case Native.commit(db) do
+      {:ok, :ok} -> {:ok, result}
+      {:error, reason} -> {:error, reason}
+    end
+  catch
+    :throw, {:glider_rolled_back, value} -> {:error, value}
+  end
+
+  @doc """
+  Abandon the enclosing `transaction/2`, which then returns `{:error, value}`.
+  """
+  @spec rollback(db(), term()) :: no_return()
+  def rollback(db, value \\ :rollback) do
+    unless Native.in_transaction(db) do
+      raise Glider.Error, message: "rollback/2 called outside a transaction"
+    end
+
+    throw({:glider_rollback, db, value})
+  end
+
+  @doc "Whether the calling process holds an open transaction on `db`."
+  @spec in_transaction?(db()) :: boolean()
+  def in_transaction?(db), do: Native.in_transaction(db)
 
   @doc """
   Labels, relationship types and indexes, with counts.
@@ -170,16 +381,20 @@ defmodule Glider do
     end
   end
 
-  @doc "Flush buffered writes to disk. A no-op for in-memory graphs."
+  @doc """
+  Fold the write-ahead log into the database pages and reclaim its space.
+  A no-op for in-memory graphs. Not allowed inside a transaction.
+  """
   @spec checkpoint(db()) :: :ok | {:error, String.t()}
   def checkpoint(db), do: unwrap_ok(Native.checkpoint(db))
 
   @doc """
-  Rewrite the file as the minimal set of records reproducing current state,
-  reclaiming space from deletes and overwrites.
+  Act on a pending replicator request now. A handle that sits idle between
+  writes should call this periodically when the file is replicated; see
+  glider's `docs/REPLICATION.md`.
   """
-  @spec compact(db()) :: :ok | {:error, String.t()}
-  def compact(db), do: unwrap_ok(Native.compact(db))
+  @spec poll_replication(db()) :: :ok | {:error, String.t()}
+  def poll_replication(db), do: unwrap_ok(Native.poll_replication(db))
 
   @doc """
   Release the graph and its file lock now, rather than at garbage collection.
@@ -201,6 +416,35 @@ defmodule Glider do
   # {:ok, :ok} that falls out of that.
   defp unwrap_ok({:ok, :ok}), do: :ok
   defp unwrap_ok({:error, reason}), do: {:error, reason}
+
+  defp stringify(params) do
+    Map.new(params, fn
+      {k, v} when is_atom(k) -> {Atom.to_string(k), v}
+      {k, v} when is_binary(k) -> {k, v}
+      {k, _} -> raise ArgumentError, "parameter names must be atoms or strings, got: #{inspect(k)}"
+    end)
+  end
+
+  defp shape_row(%Query{} = q, row), do: Query.shape(q, row)
+  defp shape_row(_q, row), do: row
+
+  defp describe(%Query{} = q), do: q |> Query.to_cypher() |> elem(0)
+  defp describe(q), do: q
+
+  @units %{"" => 1, "K" => 1 <<< 10, "M" => 1 <<< 20, "G" => 1 <<< 30, "T" => 1 <<< 40}
+
+  defp bytes(n) when is_integer(n) and n >= 0, do: n
+
+  defp bytes(s) when is_binary(s) do
+    with [_, num, unit] <- Regex.run(~r/^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*$/i, s),
+         {n, ""} <- Float.parse(num) do
+      trunc(n * Map.fetch!(@units, String.upcase(unit)))
+    else
+      _ -> raise ArgumentError, "not a size: #{inspect(s)} (use bytes, or e.g. \"256M\")"
+    end
+  end
+
+  defp bytes(other), do: raise(ArgumentError, "not a size: #{inspect(other)}")
 
   defp to_result(%{columns: columns, rows: rows, graph: graph} = map) do
     %Result{

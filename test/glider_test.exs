@@ -189,15 +189,166 @@ defmodule GliderTest do
     end
 
     @tag :tmp_dir
-    test "compact preserves state", %{tmp_dir: dir} do
+    test "checkpoint preserves state across reopen", %{tmp_dir: dir} do
       path = Path.join(dir, "c.gldb")
-      {:ok, db} = Glider.open(path)
+      {:ok, db} = Glider.open(path, cache_size: "16M", checkpoint: :off)
       {:ok, _} = Glider.run(db, @create)
       {:ok, _} = Glider.run(db, ~S|MATCH (p:Person {name:"Bob"}) DETACH DELETE p|)
 
-      assert :ok = Glider.compact(db)
+      assert :ok = Glider.checkpoint(db)
       assert {:ok, %{"nodes" => 1}} = Glider.stats(db)
       :ok = Glider.close(db)
+
+      {:ok, db2} = Glider.open(path, sync: :always)
+      assert {:ok, %{"nodes" => 1}} = Glider.stats(db2)
+      :ok = Glider.close(db2)
+    end
+
+    @tag :tmp_dir
+    test "bad open options are refused", %{tmp_dir: dir} do
+      path = Path.join(dir, "o.gldb")
+      assert_raise ArgumentError, fn -> Glider.open(path, sync: :sometimes) end
+      assert_raise ArgumentError, fn -> Glider.open(path, cache_size: "lots") end
+    end
+
+    test "an in-memory graph can be capped" do
+      {:ok, db} = Glider.open(max_memory: "64M")
+      assert {:ok, 1} = Glider.run(db, "CREATE (:A)")
+    end
+  end
+
+  describe "parameters" do
+    test "values bind by name, from a keyword list or a map" do
+      db = seeded()
+      q = "MATCH (p:Person) WHERE p.age > $min RETURN p.name"
+      assert Glider.all(db, q, min: 40) == [["Bob"]]
+      assert Glider.all(db, q, %{"min" => 30}) |> Enum.sort() == [["Ada"], ["Bob"]]
+    end
+
+    test "a value that looks like Cypher stays a value" do
+      {:ok, db} = Glider.open()
+      evil = ~S|x"}) DETACH DELETE n //|
+      {:ok, 1} = Glider.run(db, "CREATE (:T {s: $s})", s: evil)
+      assert Glider.one(db, "MATCH (t:T) RETURN t.s") == [evil]
+    end
+
+    test "lists, nil and booleans round-trip" do
+      {:ok, db} = Glider.open()
+      {:ok, _} = Glider.run(db, "CREATE (:T {xs: $xs, b: $b, n: $n})", xs: [1, 2, 3], b: true, n: nil)
+      assert [[[1, 2, 3], true]] = Glider.all(db, "MATCH (t:T) RETURN t.xs, t.b")
+    end
+
+    test "a missing parameter is an error" do
+      {:ok, db} = Glider.open()
+      assert {:error, reason} = Glider.query(db, "MATCH (n) WHERE n.x = $nope RETURN n")
+      assert reason =~ "missing parameter"
+    end
+
+    test "one/3 raises on several rows" do
+      db = seeded()
+      assert_raise Glider.Error, fn -> Glider.one(db, "MATCH (p:Person) RETURN p.name") end
+      assert Glider.one(db, "MATCH (p:Person {name: $n}) RETURN p.age", n: "Nobody") == nil
+    end
+  end
+
+  describe "transactions" do
+    test "commit makes every statement visible at once" do
+      {:ok, db} = Glider.open()
+
+      assert {:ok, :done} =
+               Glider.transaction(db, fn ->
+                 Glider.run!(db, "CREATE (:Acct {id: 1})")
+                 Glider.run!(db, "CREATE (:Acct {id: 2})")
+                 :done
+               end)
+
+      assert {:ok, %{"nodes" => 2}} = Glider.stats(db)
+    end
+
+    test "rollback/2 discards the work and returns its value" do
+      {:ok, db} = Glider.open()
+
+      assert {:error, :nope} =
+               Glider.transaction(db, fn ->
+                 Glider.run!(db, "CREATE (:Acct)")
+                 Glider.rollback(db, :nope)
+               end)
+
+      assert {:ok, %{"nodes" => 0}} = Glider.stats(db)
+      refute Glider.in_transaction?(db)
+    end
+
+    test "an exception rolls back and re-raises" do
+      {:ok, db} = Glider.open()
+
+      assert_raise RuntimeError, "boom", fn ->
+        Glider.transaction(db, fn ->
+          Glider.run!(db, "CREATE (:Acct)")
+          raise "boom"
+        end)
+      end
+
+      assert {:ok, %{"nodes" => 0}} = Glider.stats(db)
+    end
+
+    test "a failed statement aborts the transaction" do
+      {:ok, db} = Glider.open()
+
+      assert {:error, reason} =
+               Glider.transaction(db, fn ->
+                 Glider.run(db, "CREATE (:Acct)")
+                 Glider.run(db, "MATCH ((((")
+                 :ok
+               end)
+
+      assert reason =~ "aborted"
+      assert {:ok, %{"nodes" => 0}} = Glider.stats(db)
+    end
+
+    test "nested transactions join the outer one" do
+      {:ok, db} = Glider.open()
+
+      {:ok, {:ok, 1}} =
+        Glider.transaction(db, fn ->
+          Glider.transaction(db, fn -> Glider.run!(db, "CREATE (:A)") end)
+        end)
+
+      assert {:ok, %{"nodes" => 1}} = Glider.stats(db)
+    end
+
+    test "another process waits for the transaction to finish" do
+      {:ok, db} = Glider.open()
+      parent = self()
+
+      Glider.transaction(db, fn ->
+        Glider.run!(db, "CREATE (:A)")
+
+        spawn(fn ->
+          send(parent, {:reader_started, System.monotonic_time(:millisecond)})
+          {:ok, s} = Glider.stats(db)
+          send(parent, {:reader_saw, s["nodes"], System.monotonic_time(:millisecond)})
+        end)
+
+        assert_receive {:reader_started, _}
+        Process.sleep(100)
+        refute_received {:reader_saw, _, _}
+      end)
+
+      assert_receive {:reader_saw, 1, _}, 2_000
+    end
+
+    test "a transaction owner that dies is rolled back" do
+      {:ok, db} = Glider.open()
+
+      {pid, ref} =
+        spawn_monitor(fn ->
+          :ok = elem(Glider.Native.begin(db), 1)
+          Glider.run!(db, "CREATE (:Orphan)")
+          exit(:crash)
+        end)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :crash}
+      assert {:ok, %{"nodes" => 0}} = Glider.stats(db)
     end
   end
 

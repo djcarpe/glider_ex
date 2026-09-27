@@ -8,15 +8,19 @@ defmodule Glider.Native do
 
   use Rustler, otp_app: :glider_ex, crate: "glider_nif"
 
-  def open_memory, do: err()
-  def open_file(_path, _sync), do: err()
-  def query(_db, _q), do: err()
+  def open_memory(_max_bytes), do: err()
+  def open_file(_path, _sync, _cache_size, _work_mem, _checkpoint_bytes), do: err()
+  def query(_db, _q, _params), do: err()
   def schema(_db), do: err()
   def expand(_db, _id, _limit), do: err()
   def import_jsonl(_db, _jsonl), do: err()
   def export_jsonl(_db), do: err()
   def checkpoint(_db), do: err()
-  def compact(_db), do: err()
+  def begin(_db), do: err()
+  def commit(_db), do: err()
+  def rollback(_db), do: err()
+  def in_transaction(_db), do: err()
+  def poll_replication(_db), do: err()
   def close(_db), do: err()
   def version, do: err()
 
