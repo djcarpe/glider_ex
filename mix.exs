@@ -80,10 +80,10 @@ defmodule Glider.MixProject do
 
   defp package do
     [
-      licenses: ["MIT", "Apache-2.0"],
+      licenses: ["MIT"],
       links: %{"GitHub" => @source_url},
       files: ~w(lib native/glider_nif/src native/glider_nif/Cargo.toml
-                native/glider_nif/Cargo.lock mix.exs README.md)
+                native/glider_nif/Cargo.lock mix.exs README.md LICENSE)
     ]
   end
 
