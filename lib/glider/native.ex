@@ -10,6 +10,8 @@ defmodule Glider.Native do
 
   def open_memory(_max_bytes), do: err()
   def open_file(_path, _sync, _cache_size, _work_mem, _checkpoint_bytes), do: err()
+  def legacy_kind(_path), do: err()
+  def migrate(_path), do: err()
   def query(_db, _q, _params), do: err()
   def schema(_db), do: err()
   def expand(_db, _id, _limit), do: err()

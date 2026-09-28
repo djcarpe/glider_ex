@@ -177,6 +177,31 @@ defmodule Glider do
   end
 
   @doc """
+  Whether `path` holds a database in glider's legacy log format, which the
+  paged engine refuses to open until it is migrated. Returns the format's
+  name, or `nil` for a paged database, a missing file, or a file that is not
+  glider's.
+  """
+  @spec legacy(Path.t()) :: String.t() | nil
+  def legacy(path) when is_binary(path), do: Native.legacy_kind(path)
+
+  @doc """
+  Convert a legacy log-format database into a paged one, in place.
+
+  The new database is built beside the old and swapped in; the original is
+  kept as `<path>.legacy.bak`. Returns how many nodes and edges were copied.
+  Nothing may have the file open while this runs.
+  """
+  @spec migrate(Path.t()) ::
+          {:ok, %{nodes: non_neg_integer(), edges: non_neg_integer()}} | {:error, String.t()}
+  def migrate(path) when is_binary(path) do
+    case Native.migrate(path) do
+      {:ok, {nodes, edges}} -> {:ok, %{nodes: nodes, edges: edges}}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc """
   Run a query.
 
   `query` is a string or a `Glider.Query`. `params` fill `$name` placeholders;
@@ -265,9 +290,16 @@ defmodule Glider do
 
   def one(db, q, params) do
     case all(db, q, params) do
-      [] -> nil
-      [row] -> row
-      rows -> raise Glider.Error, message: "expected at most one row, got #{length(rows)}", query: describe(q)
+      [] ->
+        nil
+
+      [row] ->
+        row
+
+      rows ->
+        raise Glider.Error,
+          message: "expected at most one row, got #{length(rows)}",
+          query: describe(q)
     end
   end
 
@@ -419,9 +451,14 @@ defmodule Glider do
 
   defp stringify(params) do
     Map.new(params, fn
-      {k, v} when is_atom(k) -> {Atom.to_string(k), v}
-      {k, v} when is_binary(k) -> {k, v}
-      {k, _} -> raise ArgumentError, "parameter names must be atoms or strings, got: #{inspect(k)}"
+      {k, v} when is_atom(k) ->
+        {Atom.to_string(k), v}
+
+      {k, v} when is_binary(k) ->
+        {k, v}
+
+      {k, _} ->
+        raise ArgumentError, "parameter names must be atoms or strings, got: #{inspect(k)}"
     end)
   end
 

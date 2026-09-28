@@ -549,4 +549,47 @@ fn version() -> &'static str {
     glider::VERSION
 }
 
+/// The kind of legacy (pre-paged) file at `path`, or nothing if it is a paged
+/// database, absent, or not glider's at all. A stat and a header read.
+#[rustler::nif(schedule = "DirtyIo")]
+fn legacy_kind(path: String) -> Option<String> {
+    glider::legacy::detect(Path::new(&path)).map(|k| k.to_string())
+}
+
+/// Convert a legacy log-format database into a paged one, in place: the new
+/// database is built beside the old under `<path>.migrating`, then swapped in,
+/// and the original is kept as `<path>.legacy.bak`. Returns the node and edge
+/// counts copied. Reads and writes the whole graph, so DirtyIo.
+#[rustler::nif(schedule = "DirtyIo")]
+fn migrate(path: String) -> Result<(u64, u64), String> {
+    let db = Path::new(&path);
+    if glider::legacy::detect(db).is_none() {
+        return Err(format!("{path} is not a legacy glider file; nothing to migrate"));
+    }
+    let old = glider::legacy::graph::Graph::open(db, GliderSync::Normal).map_err(|e| e.to_string())?;
+    let tmp = format!("{path}.migrating");
+    for suffix in ["", "-wal", "-data", ".lock"] {
+        let _ = std::fs::remove_file(format!("{tmp}{suffix}"));
+    }
+    let mut g = Graph::open(Path::new(&tmp), GliderSync::Off).map_err(|e| e.to_string())?;
+    g.import_legacy(&old).map_err(|e| e.to_string())?;
+    g.checkpoint().map_err(|e| e.to_string())?;
+    let (n, e) = (g.node_count() as u64, g.edge_count() as u64);
+    drop(g);
+    drop(old);
+    std::fs::rename(db, format!("{path}.legacy.bak")).map_err(|e| e.to_string())?;
+    for (from, to) in [
+        (tmp.clone(), path.clone()),
+        (format!("{tmp}-wal"), format!("{path}-wal")),
+        (format!("{tmp}-data"), format!("{path}-data")),
+    ] {
+        if Path::new(&from).exists() {
+            std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+        }
+    }
+    let _ = std::fs::remove_file(format!("{tmp}.lock"));
+    let _ = std::fs::remove_file(format!("{path}.lock"));
+    Ok((n, e))
+}
+
 rustler::init!("Elixir.Glider.Native");

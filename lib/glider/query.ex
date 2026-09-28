@@ -148,7 +148,8 @@ defmodule Glider.Query do
       match(q, "(c:City {name: $city})", city: "London")
       match(q, vertex(:c, "City", %{name: "London"}))
   """
-  @spec match(t() | String.t() | Fragment.t(), String.t() | Fragment.t() | keyword() | map()) :: t()
+  @spec match(t() | String.t() | Fragment.t(), String.t() | Fragment.t() | keyword() | map()) ::
+          t()
   def match(query_or_pattern, pattern_or_params \\ [])
 
   def match(%__MODULE__{} = q, pattern), do: match(q, pattern, [])
@@ -169,7 +170,8 @@ defmodule Glider.Query do
       match("(a:Person {name: $a}), (b:Person {name: $b})", a: "Ada", b: "Bob")
       |> create(edge(:a, "KNOWS", :b, %{since: 2020}))
   """
-  @spec create(t() | String.t() | Fragment.t(), String.t() | Fragment.t() | keyword() | map()) :: t()
+  @spec create(t() | String.t() | Fragment.t(), String.t() | Fragment.t() | keyword() | map()) ::
+          t()
   def create(query_or_pattern, pattern_or_params \\ [])
 
   def create(%__MODULE__{} = q, pattern), do: create(q, pattern, [])
@@ -235,7 +237,9 @@ defmodule Glider.Query do
   """
   defmacro return(query, spec) do
     {items, shape} = compile_return(spec)
-    quote do: Glider.Query.__return__(unquote(query), unquote(items), unquote(Macro.escape(shape)))
+
+    quote do:
+            Glider.Query.__return__(unquote(query), unquote(items), unquote(Macro.escape(shape)))
   end
 
   @doc "Return distinct rows."
@@ -265,7 +269,8 @@ defmodule Glider.Query do
   defmacro skip(query, n), do: quote(do: Glider.Query.__skip__(unquote(query), unquote(unpin(n))))
 
   @doc "Return at most `n` rows. `n` may be pinned or a plain expression."
-  defmacro limit(query, n), do: quote(do: Glider.Query.__limit__(unquote(query), unquote(unpin(n))))
+  defmacro limit(query, n),
+    do: quote(do: Glider.Query.__limit__(unquote(query), unquote(unpin(n))))
 
   @doc """
   Set properties on matched entities. Several assignments may be given at once.
@@ -344,7 +349,11 @@ defmodule Glider.Query do
   @spec delete(t(), atom() | [atom()], keyword()) :: t()
   def delete(%__MODULE__{} = q, vars, opts \\ []) do
     q = ensure_action(q, :delete)
-    %{q | action: {:delete, Enum.map(List.wrap(vars), &ident/1), Keyword.get(opts, :detach, false)}}
+
+    %{
+      q
+      | action: {:delete, Enum.map(List.wrap(vars), &ident/1), Keyword.get(opts, :detach, false)}
+    }
   end
 
   @doc """
@@ -452,16 +461,26 @@ defmodule Glider.Query do
 
   @doc false
   def __skip__(%__MODULE__{} = q, n) when is_integer(n) and n >= 0, do: %{q | skip: n}
-  def __skip__(_q, n), do: raise(ArgumentError, "skip/2 needs a non-negative integer, got: #{inspect(n)}")
+
+  def __skip__(_q, n),
+    do: raise(ArgumentError, "skip/2 needs a non-negative integer, got: #{inspect(n)}")
 
   @doc false
   def __limit__(%__MODULE__{} = q, n) when is_integer(n) and n >= 0, do: %{q | limit: n}
-  def __limit__(_q, n), do: raise(ArgumentError, "limit/2 needs a non-negative integer, got: #{inspect(n)}")
+
+  def __limit__(_q, n),
+    do: raise(ArgumentError, "limit/2 needs a non-negative integer, got: #{inspect(n)}")
 
   @doc false
   def __set__(%__MODULE__{} = q, frags) do
     q = ensure_action(q, :set)
-    prior = case q.action, do: ({:set, items} -> items; _ -> [])
+
+    prior =
+      case q.action,
+        do: (
+          {:set, items} -> items
+          _ -> []
+        )
 
     {texts, q} =
       Enum.map_reduce(frags, q, fn frag, q ->
@@ -475,7 +494,14 @@ defmodule Glider.Query do
   @doc false
   def __remove__(%__MODULE__{} = q, text) do
     q = ensure_action(q, :remove)
-    prior = case q.action, do: ({:remove, items} -> items; _ -> [])
+
+    prior =
+      case q.action,
+        do: (
+          {:remove, items} -> items
+          _ -> []
+        )
+
     %{q | action: {:remove, prior ++ [text]}}
   end
 
@@ -483,16 +509,30 @@ defmodule Glider.Query do
 
   defp where_text(%{where: []}), do: ""
   defp where_text(%{where: [one]}), do: " WHERE " <> one
-  defp where_text(%{where: many}), do: " WHERE " <> Enum.map_join(many, " AND ", &("(" <> &1 <> ")"))
+
+  defp where_text(%{where: many}),
+    do: " WHERE " <> Enum.map_join(many, " AND ", &("(" <> &1 <> ")"))
 
   defp tail_text(q) do
     case q.action do
-      nil -> "RETURN *" <> order_text(q)
-      :return -> "RETURN " <> if(q.distinct, do: "DISTINCT ", else: "") <> Enum.join(q.return, ", ") <> order_text(q)
-      {:set, items} -> "SET " <> Enum.join(items, ", ")
-      {:remove, items} -> "REMOVE " <> Enum.join(items, ", ")
-      {:delete, vars, detach} -> if(detach, do: "DETACH DELETE ", else: "DELETE ") <> Enum.join(vars, ", ")
-      {:create, pats} -> "CREATE " <> Enum.join(pats, ", ")
+      nil ->
+        "RETURN *" <> order_text(q)
+
+      :return ->
+        "RETURN " <>
+          if(q.distinct, do: "DISTINCT ", else: "") <> Enum.join(q.return, ", ") <> order_text(q)
+
+      {:set, items} ->
+        "SET " <> Enum.join(items, ", ")
+
+      {:remove, items} ->
+        "REMOVE " <> Enum.join(items, ", ")
+
+      {:delete, vars, detach} ->
+        if(detach, do: "DETACH DELETE ", else: "DELETE ") <> Enum.join(vars, ", ")
+
+      {:create, pats} ->
+        "CREATE " <> Enum.join(pats, ", ")
     end
   end
 
@@ -500,7 +540,9 @@ defmodule Glider.Query do
     # glider orders by returned columns: an expression that is also returned
     # under an alias is ordered by that alias.
     aliases =
-      for item <- q.return || [], [expr, name] <- [String.split(item, " AS ", parts: 2)], into: %{},
+      for item <- q.return || [],
+          [expr, name] <- [String.split(item, " AS ", parts: 2)],
+          into: %{},
           do: {expr, name}
 
     order =
@@ -547,9 +589,15 @@ defmodule Glider.Query do
       key = to_string(k)
 
       case q.params do
-        %{^key => ^v} -> q
-        %{^key => other} -> raise ArgumentError, "parameter $#{key} given twice, as #{inspect(other)} and #{inspect(v)}"
-        _ -> %{q | params: Map.put(q.params, key, v)}
+        %{^key => ^v} ->
+          q
+
+        %{^key => other} ->
+          raise ArgumentError,
+                "parameter $#{key} given twice, as #{inspect(other)} and #{inspect(v)}"
+
+        _ ->
+          %{q | params: Map.put(q.params, key, v)}
       end
     end)
   end
@@ -603,9 +651,14 @@ defmodule Glider.Query do
 
   def ident(name) when is_binary(name) do
     cond do
-      name =~ ~r/^[A-Za-z_][A-Za-z0-9_]*$/ -> name
-      String.contains?(name, "`") -> raise ArgumentError, "names cannot contain a backtick: #{inspect(name)}"
-      true -> "`" <> name <> "`"
+      name =~ ~r/^[A-Za-z_][A-Za-z0-9_]*$/ ->
+        name
+
+      String.contains?(name, "`") ->
+        raise ArgumentError, "names cannot contain a backtick: #{inspect(name)}"
+
+      true ->
+        "`" <> name <> "`"
     end
   end
 
@@ -641,7 +694,9 @@ defmodule Glider.Query do
   defp expr(nil, _pos), do: ["null"]
   defp expr(s, _pos) when is_binary(s), do: [{:param, s}]
   defp expr(a, _pos) when is_atom(a), do: [{:param, Atom.to_string(a)}]
-  defp expr(list, _pos) when is_list(list), do: ["["] ++ Enum.intersperse(Enum.map(list, &expr(&1, :inner)), ", ") ++ ["]"]
+
+  defp expr(list, _pos) when is_list(list),
+    do: ["["] ++ Enum.intersperse(Enum.map(list, &expr(&1, :inner)), ", ") ++ ["]"]
 
   # not is_nil(x) -> x IS NOT NULL
   defp expr({op, _, [{:is_nil, _, [x]}]}, pos) when op in [:not, :!],
@@ -651,7 +706,8 @@ defmodule Glider.Query do
   defp expr({op, _, [x]}, pos) when op in [:not, :!], do: wrap(pos, ["NOT ", expr(x, :inner)])
   defp expr({:-, _, [x]}, _pos), do: ["-", expr(x, :inner)]
 
-  defp expr({:in, _, [x, list]}, pos), do: wrap(pos, [expr(x, :inner), " IN ", expr(list, :inner)])
+  defp expr({:in, _, [x, list]}, pos),
+    do: wrap(pos, [expr(x, :inner), " IN ", expr(list, :inner)])
 
   defp expr({op, _, [a, b]}, pos) when is_map_key(@binary, op),
     do: wrap(pos, [expr(a, :inner), " ", @binary[op], " ", expr(b, :inner)])
@@ -670,14 +726,18 @@ defmodule Glider.Query do
     pieces = String.split(text, "?")
 
     if length(pieces) != length(args) + 1 do
-      raise ArgumentError, "fragment/n: #{length(pieces) - 1} placeholders but #{length(args)} arguments"
+      raise ArgumentError,
+            "fragment/n: #{length(pieces) - 1} placeholders but #{length(args)} arguments"
     end
 
     ["("] ++ interleave(pieces, Enum.map(args, &expr(&1, :inner))) ++ [")"]
   end
 
-  defp expr({fun, _, args}, _pos) when is_atom(fun) and is_list(args) and is_map_key(@functions, fun),
-    do: [@functions[fun], "("] ++ Enum.intersperse(Enum.map(args, &expr(&1, :inner)), ", ") ++ [")"]
+  defp expr({fun, _, args}, _pos)
+       when is_atom(fun) and is_list(args) and is_map_key(@functions, fun),
+       do:
+         [@functions[fun], "("] ++
+           Enum.intersperse(Enum.map(args, &expr(&1, :inner)), ", ") ++ [")"]
 
   # a pattern variable
   defp expr({var, _, ctx}, _pos) when is_atom(var) and is_atom(ctx), do: [ident(var)]
@@ -714,12 +774,16 @@ defmodule Glider.Query do
 
   defp compile_assign({:=, _, [{{:., _, [{var, _, ctx}, field]}, _, []}, value]})
        when is_atom(var) and is_atom(ctx) and is_atom(field) do
-    parts = List.flatten([ident(var) <> "." <> ident(field) <> " = ", expr(value, :top)]) |> merge_text()
+    parts =
+      List.flatten([ident(var) <> "." <> ident(field) <> " = ", expr(value, :top)])
+      |> merge_text()
+
     quote do: %Glider.Query.Fragment{parts: unquote(parts)}
   end
 
   defp compile_assign(other) do
-    raise ArgumentError, "set/2 takes assignments like p.name = ^name; got: #{Macro.to_string(other)}"
+    raise ArgumentError,
+          "set/2 takes assignments like p.name = ^name; got: #{Macro.to_string(other)}"
   end
 
   defp unpin({:^, _, [e]}), do: e
