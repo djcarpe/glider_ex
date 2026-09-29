@@ -29,6 +29,12 @@ defmodule Glider.Telemetry do
   | `[:glider, :checkpoint, _]` | on stop `:result`, `:error` | |
   | `[:glider, :import, _]` | `:bytes`; on stop `:result`, `:error` | |
   | `[:glider, :export, _]` | on stop `:result`, `:error` | |
+  | `[:glider, :procedure, _]` | `:procedure`; on stop `:operation` (`"CALL"`), `:result`, `:error` | `rows` |
+
+  `[:glider, :procedure, _]` is the contract for procedures that run outside
+  the engine, in Elixir — `glider_extensions_ex` emits it for `text.embed`,
+  `cluster.kmeans` and the rest — so they are measured and traced like the
+  engine's own `CALL`s.
 
   `:operation` is the statement kind the engine parsed — `"MATCH"`,
   `"CREATE"`, `"CALL"`, ... or `"INVALID"` — and `:procedure` the algorithm a

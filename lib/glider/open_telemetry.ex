@@ -30,7 +30,7 @@ defmodule Glider.OpenTelemetry do
   # opentelemetry_api is optional: compile cleanly without it.
   @compile {:no_warn_undefined, [:opentelemetry, :otel_tracer, :otel_span, :otel_ctx]}
 
-  @spans [:query, :transaction, :checkpoint, :import, :export]
+  @spans [:query, :transaction, :checkpoint, :import, :export, :procedure]
   @handler __MODULE__
   @max_query_text 2048
 

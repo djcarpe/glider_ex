@@ -140,6 +140,17 @@ defmodule Glider.TelemetryTest do
 
       assert_receive {:span, span(name: "glider CREATE", parent_span_id: ^tx_id)}
 
+      # A procedure run outside the engine (glider_extensions_ex) is a CALL
+      # span too, and the statements it runs are its children.
+      :telemetry.span([:glider, :procedure], %{db: db, procedure: "my.proc"}, fn ->
+        Glider.run!(db, "CREATE (:Made)")
+        {:ok, %{rows: 3}, %{db: db, procedure: "my.proc", operation: "CALL", result: :ok}}
+      end)
+
+      assert_receive {:span, span(name: "glider CALL", span_id: proc_id, attributes: proc_attrs)}
+      assert :otel_attributes.map(proc_attrs)[:"db.stored_procedure.name"] == "my.proc"
+      assert_receive {:span, span(name: "glider CREATE", parent_span_id: ^proc_id)}
+
       assert_receive {:span, span(name: "glider INVALID", status: status)}
       assert {:status, :error, msg} = status
       assert is_binary(msg) and msg != ""
