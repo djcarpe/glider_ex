@@ -25,6 +25,12 @@ defmodule Glider.Native do
   def poll_replication(_db), do: err()
   def close(_db), do: err()
   def version, do: err()
+  def telemetry_snapshot, do: err()
+  def db_metrics(_db), do: err()
+  def metrics_prometheus(_dbs), do: err()
+  def metrics_otlp(_dbs, _service), do: err()
+  def start_exporter(_service, _traces), do: err()
+  def flush_exporter, do: err()
 
   defp err, do: :erlang.nif_error(:nif_not_loaded)
 end

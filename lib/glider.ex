@@ -79,6 +79,15 @@ defmodule Glider do
   Durability modes are `:always` (survives power loss), `:normal` (the default;
   survives process death) and `:off` (buffered, for bulk load).
 
+  ## Telemetry
+
+  Queries, transactions, checkpoints, imports and exports emit `:telemetry`
+  span events (`[:glider, :query, :start | :stop | :exception]` and so on),
+  carrying the engine's own report — rows, pages read, cache hits — as
+  measurements. `Glider.OpenTelemetry.setup/1` turns them into OpenTelemetry
+  spans; `Glider.Telemetry` has the event catalogue, engine counters,
+  Prometheus and OTLP renderers, and per-database metrics.
+
   ## Query language
 
   A Cypher-flavoured subset. Two divergences catch people out:
@@ -222,10 +231,20 @@ defmodule Glider do
   end
 
   def query(db, q, params) when is_binary(q) do
-    case Native.query(db, q, Map.to_list(stringify(params))) do
-      {:ok, map} -> {:ok, to_result(map)}
-      {:error, reason} -> {:error, reason}
-    end
+    params = Map.to_list(stringify(params))
+    meta = %{db: db, query: q}
+
+    :telemetry.span([:glider, :query], meta, fn ->
+      case Native.query(db, q, params) do
+        {:ok, {map, op}} ->
+          {{:ok, to_result(map)}, Glider.Telemetry.measurements(op),
+           Glider.Telemetry.stop_metadata(meta, op, :ok)}
+
+        {:error, {reason, op}} ->
+          {{:error, reason}, Glider.Telemetry.measurements(op),
+           meta |> Glider.Telemetry.stop_metadata(op, :error) |> Map.put(:error, reason)}
+      end
+    end)
   end
 
   @doc """
@@ -328,7 +347,11 @@ defmodule Glider do
     if Native.in_transaction(db) do
       {:ok, fun.()}
     else
-      with {:ok, :ok} <- Native.begin(db), do: run_transaction(db, fun)
+      # A span around the whole transaction: with Glider.OpenTelemetry its
+      # statements become children of it.
+      instrument(:transaction, %{db: db}, fn ->
+        with {:ok, :ok} <- Native.begin(db), do: run_transaction(db, fun)
+      end)
     end
   end
 
@@ -399,11 +422,15 @@ defmodule Glider do
   """
   @spec import_jsonl(db(), String.t()) ::
           {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, String.t()}
-  def import_jsonl(db, jsonl) when is_binary(jsonl), do: Native.import_jsonl(db, jsonl)
+  def import_jsonl(db, jsonl) when is_binary(jsonl) do
+    instrument(:import, %{db: db, bytes: byte_size(jsonl)}, fn ->
+      Native.import_jsonl(db, jsonl)
+    end)
+  end
 
   @doc "Dump the whole graph as JSON Lines, re-importable by `import_jsonl/2`."
   @spec export_jsonl(db()) :: {:ok, String.t()} | {:error, String.t()}
-  def export_jsonl(db), do: Native.export_jsonl(db)
+  def export_jsonl(db), do: instrument(:export, %{db: db}, fn -> Native.export_jsonl(db) end)
 
   @doc "Node, edge, label and index counts, as a map."
   @spec stats(db()) :: {:ok, map()} | {:error, String.t()}
@@ -418,7 +445,9 @@ defmodule Glider do
   A no-op for in-memory graphs. Not allowed inside a transaction.
   """
   @spec checkpoint(db()) :: :ok | {:error, String.t()}
-  def checkpoint(db), do: unwrap_ok(Native.checkpoint(db))
+  def checkpoint(db) do
+    instrument(:checkpoint, %{db: db}, fn -> unwrap_ok(Native.checkpoint(db)) end)
+  end
 
   @doc """
   Act on a pending replicator request now. A handle that sits idle between
@@ -442,6 +471,19 @@ defmodule Glider do
   def version, do: Native.version()
 
   # ------------------------------------------------------------------ private
+
+  # A `[:glider, event, ...]` telemetry span whose stop metadata says how it
+  # ended: `result: :ok | :error`, and `error:` with the reason.
+  defp instrument(event, meta, fun) do
+    :telemetry.span([:glider, event], meta, fn ->
+      result = fun.()
+
+      case result do
+        {:error, reason} -> {result, Map.merge(meta, %{result: :error, error: reason})}
+        _ -> {result, Map.put(meta, :result, :ok)}
+      end
+    end)
+  end
 
   # The NIF returns Result<_, String>, which rustler encodes as {:ok, _} /
   # {:error, reason}. For calls whose success payload is just :ok, collapse the

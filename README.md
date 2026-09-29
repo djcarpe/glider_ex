@@ -198,6 +198,40 @@ literal `#{...}` inside a query is not read as interpolation.
     Use `Glider.stats/1` for a count that is always present.
   * `count(DISTINCT x)` is unsupported; `RETURN DISTINCT` works.
 
+## Telemetry
+
+Queries, transactions, checkpoints, imports and exports emit `:telemetry` span
+events: `[:glider, :query, :start | :stop | :exception]` and so on. The
+engine's own report on each statement comes with them. `:stop` carries
+`rows`, `touched`, `page_reads`, `page_hits`, `page_misses` and
+`engine_duration` as measurements, and `operation` (`"MATCH"`, `"CALL"`, ...),
+`procedure`, `db_name` and `result` as metadata.
+
+OpenTelemetry spans, parented under the calling process's current span. Add
+`{:opentelemetry_api, "~> 1.4"}` and an SDK to your app, then:
+
+```elixir
+:ok = Glider.OpenTelemetry.setup()
+```
+
+Each statement becomes a client span named after its operation (`glider
+MATCH`), with the same attributes glider's native and wasm runtimes use
+(`db.system.name`, `db.operation.name`, `db.query.text`,
+`db.response.returned_rows`, `glider.page.hits`, ...). A `Glider.transaction/2`
+span parents the statements inside it.
+
+Metrics:
+
+| | |
+|---|---|
+| `Glider.Telemetry.emit_db_metrics/1` | `[:glider, :db]` gauges, for `:telemetry_poller` |
+| `Glider.Telemetry.prometheus/1` | Prometheus text for a `/metrics` plug |
+| `Glider.Telemetry.start_exporter/1` | the engine's own OTLP exporter, from `OTEL_*` env vars |
+| `Glider.Telemetry.snapshot/0`, `metrics/1`, `otlp_metrics/2` | the raw numbers |
+
+See `Glider.Telemetry` for the event catalogue, and glider's
+`docs/OBSERVABILITY.md` for the names every runtime shares.
+
 ## Benchmarks
 
 ```sh
@@ -221,6 +255,8 @@ write code against this library:
 lib/glider.ex              public API
 lib/glider/query.ex        Glider.Query, the composable query builder
 lib/glider/structs.ex      %Glider.Node{}, %Glider.Rel{}, %Glider.Result{}
+lib/glider/telemetry.ex    events, engine metrics, the native OTLP exporter
+lib/glider/open_telemetry.ex  OpenTelemetry spans from the events
 lib/glider/native.ex       raw NIF surface (private)
 native/glider_nif/         the Rustler crate
 ```

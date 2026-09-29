@@ -28,6 +28,13 @@ defmodule Glider.MixProject do
   defp deps do
     [
       {:rustler, "~> 0.37"},
+      # The BEAM's instrumentation contract: glider emits events, the host
+      # decides where they go (see Glider.Telemetry).
+      {:telemetry, "~> 1.1"},
+      # Only for Glider.OpenTelemetry; without it that module reports
+      # {:error, :opentelemetry_not_loaded} and nothing else changes.
+      {:opentelemetry_api, "~> 1.4", optional: true},
+      {:opentelemetry, "~> 1.5", only: :test},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:benchee, "~> 1.3", only: [:dev, :bench], runtime: false}
     ]

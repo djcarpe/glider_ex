@@ -26,6 +26,13 @@
 //! Results are built as native Erlang terms rather than JSON. Every fallible
 //! NIF returns `Result<_, String>`, which rustler encodes as `{:ok, _}` or
 //! `{:error, reason}`.
+//!
+//! Telemetry: `query` hands back the engine's report on the statement (rows,
+//! pages read and hit, duration) alongside the result, and on failure, so the
+//! Elixir side can put it on `:telemetry` events and OpenTelemetry spans. The
+//! report is returned in-band rather than read afterwards because the next
+//! NIF call may land on a different dirty scheduler thread, and the engine
+//! keeps "last statement" per thread.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -38,6 +45,7 @@ use glider::api::{self, Entity};
 use glider::graph::{Dir, Graph, OpenOptions};
 use glider::query::{self, QueryResult};
 use glider::store::Sync as GliderSync;
+use glider::telemetry::{self, DbMetrics, OpReport};
 use glider::value::Value;
 
 mod atoms {
@@ -282,6 +290,65 @@ fn graph_term<'a>(
     Term::map_from_arrays(env, &keys, &values).expect("graph map")
 }
 
+/// A map with atom keys. Keys here are fixed names, never user data.
+fn map_term<'a>(env: Env<'a>, pairs: Vec<(&str, Term<'a>)>) -> Term<'a> {
+    let keys: Vec<Term<'a>> = pairs.iter().map(|(k, _)| atom_term(env, k)).collect();
+    let values: Vec<Term<'a>> = pairs.into_iter().map(|(_, v)| v).collect();
+    Term::map_from_arrays(env, &keys, &values).expect("fixed keys")
+}
+
+fn opt_term<'a, T: Encoder>(env: Env<'a>, v: Option<T>) -> Term<'a> {
+    match v {
+        Some(v) => v.encode(env),
+        None => atoms::nil().encode(env),
+    }
+}
+
+/// The engine's report on one statement, and the name telemetry gives the
+/// graph it ran against.
+fn op_term<'a>(env: Env<'a>, r: &OpReport, db: &str) -> Term<'a> {
+    map_term(
+        env,
+        vec![
+            ("db", db.encode(env)),
+            ("op", r.op.encode(env)),
+            ("procedure", opt_term(env, r.procedure.as_deref())),
+            ("rows", r.rows.encode(env)),
+            ("touched", r.touched.encode(env)),
+            ("page_reads", r.page_reads.encode(env)),
+            ("page_writes", r.page_writes.encode(env)),
+            ("page_hits", r.page_hits.encode(env)),
+            ("page_misses", r.page_misses.encode(env)),
+            ("duration_ns", opt_term(env, r.duration_ns)),
+        ],
+    )
+}
+
+fn db_metrics_term<'a>(env: Env<'a>, name: &str, m: &DbMetrics) -> Term<'a> {
+    map_term(
+        env,
+        vec![
+            ("name", name.encode(env)),
+            ("nodes", m.nodes.encode(env)),
+            ("edges", m.edges.encode(env)),
+            ("bytes", m.bytes.encode(env)),
+            ("memory_limit", opt_term(env, m.memory_limit)),
+            ("page_size", m.page_size.encode(env)),
+            ("resident_pages", m.resident_pages.encode(env)),
+            ("allocated_pages", m.allocated_pages.encode(env)),
+            ("log_bytes", m.log_bytes.encode(env)),
+            ("page_reads", m.page_reads.encode(env)),
+            ("page_writes", m.page_writes.encode(env)),
+            ("page_hits", m.page_hits.encode(env)),
+            ("page_misses", m.page_misses.encode(env)),
+            ("evictions", m.evictions.encode(env)),
+            ("commits", m.commits.encode(env)),
+            ("rollbacks", m.rollbacks.encode(env)),
+            ("checkpoints", m.checkpoints.encode(env)),
+        ],
+    )
+}
+
 /// Turn a QueryResult into the map Elixir wraps as `%Glider.Result{}`,
 /// including the deduplicated graph projection.
 fn result_term<'a>(env: Env<'a>, g: &Graph, r: &QueryResult) -> Term<'a> {
@@ -386,18 +453,112 @@ fn open_file(
 
 /// Queries are unbounded — a whole-graph algorithm can run for minutes — so
 /// this never touches a normal scheduler. `params` are `$name` values.
+///
+/// Returns `{:ok, {result, op}}` or `{:error, {reason, op | nil}}`, where
+/// `op` is the engine's report on the statement (nil when it never ran:
+/// bad parameters, a closed handle, an aborted transaction).
 #[rustler::nif(schedule = "DirtyCpu")]
 fn query<'a>(
     env: Env<'a>,
     db: ResourceArc<DbResource>,
     q: String,
     params: Vec<(String, Term<'a>)>,
-) -> Result<Term<'a>, String> {
-    let params = params_of(params)?;
-    db.with(env.pid(), |g| {
+) -> Result<(Term<'a>, Term<'a>), (String, Term<'a>)> {
+    let nil = atoms::nil().encode(env);
+    let params = params_of(params).map_err(|e| (e, nil))?;
+    let mut ran = None;
+    let out = db.with(env.pid(), |g| {
+        ran = Some(g.telemetry_name());
         let r = query::execute_with(g, &q, &params).map_err(|e| e.to_string())?;
         Ok(result_term(env, g, &r))
-    })
+    });
+    // Same thread as the statement: the engine's per-thread report is ours.
+    let op = match (telemetry::last_op(), ran) {
+        (Some(r), Some(name)) => op_term(env, &r, &name),
+        _ => nil,
+    };
+    match out {
+        Ok(result) => Ok((result, op)),
+        Err(e) => Err((e, op)),
+    }
+}
+
+/// The process-wide counters: statements by operation and outcome, rows,
+/// touched, page traffic, the duration histogram. Atomics only: no lock, so
+/// a normal scheduler.
+#[rustler::nif]
+fn telemetry_snapshot(env: Env) -> Term {
+    let s = telemetry::snapshot();
+    let queries: Vec<Term> = s
+        .queries
+        .iter()
+        .map(|(op, ok, err)| map_term(env, vec![("op", op.encode(env)), ("ok", ok.encode(env)), ("error", err.encode(env))]))
+        .collect();
+    map_term(
+        env,
+        vec![
+            ("queries", queries.encode(env)),
+            ("rows", s.rows.encode(env)),
+            ("touched", s.touched.encode(env)),
+            ("page_reads", s.page_reads.encode(env)),
+            ("page_writes", s.page_writes.encode(env)),
+            ("page_hits", s.page_hits.encode(env)),
+            ("page_misses", s.page_misses.encode(env)),
+            ("duration_count", s.duration_count.encode(env)),
+            ("duration_sum_ns", s.duration_sum_ns.encode(env)),
+            ("duration_bounds", telemetry::DURATION_BOUNDS.to_vec().encode(env)),
+            ("duration_buckets", s.duration_buckets.encode(env)),
+        ],
+    )
+}
+
+/// `(name, metrics)` for each open handle. Takes each graph's mutex (not the
+/// transaction: counters are fine to read mid-transaction), which a long
+/// query holds — hence the dirty schedulers below.
+fn db_list(dbs: &[ResourceArc<DbResource>]) -> Vec<(String, DbMetrics)> {
+    dbs.iter()
+        .filter_map(|db| {
+            let st = db.lock();
+            st.graph.as_ref().map(|g| (g.telemetry_name(), g.telemetry()))
+        })
+        .collect()
+}
+
+/// One graph's counts, size, cache and commit counters.
+#[rustler::nif(schedule = "DirtyIo")]
+fn db_metrics(env: Env, db: ResourceArc<DbResource>) -> Result<Term, String> {
+    let st = db.lock();
+    let g = st.graph.as_ref().ok_or("this graph is closed")?;
+    Ok(db_metrics_term(env, &g.telemetry_name(), &g.telemetry()))
+}
+
+/// Process counters and `dbs` in the Prometheus text format.
+#[rustler::nif(schedule = "DirtyIo")]
+fn metrics_prometheus(dbs: Vec<ResourceArc<DbResource>>) -> String {
+    telemetry::prometheus(&db_list(&dbs))
+}
+
+/// Process counters and `dbs` as an OTLP/HTTP JSON metrics request.
+#[rustler::nif(schedule = "DirtyIo")]
+fn metrics_otlp(dbs: Vec<ResourceArc<DbResource>>, service: String) -> String {
+    let res = telemetry::default_resource(&service);
+    let now = telemetry::now_unix_ns().unwrap_or(0);
+    telemetry::otlp_metrics_json(&res, now, &db_list(&dbs))
+}
+
+/// Start the engine's own OTLP exporter from the `OTEL_*` environment, with
+/// spans on or off. Returns whether one is running.
+#[rustler::nif]
+fn start_exporter(service: String, traces: bool) -> Result<bool, String> {
+    telemetry::otlp::install_from_env_signals(&service, traces)
+}
+
+/// Push the engine exporter's pending spans and metrics now: a blocking HTTP
+/// round trip, so DirtyIo.
+#[rustler::nif(schedule = "DirtyIo")]
+fn flush_exporter() -> Atom {
+    telemetry::otlp::flush();
+    atoms::ok()
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
