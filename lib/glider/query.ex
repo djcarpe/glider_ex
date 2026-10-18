@@ -380,7 +380,9 @@ defmodule Glider.Query do
       |> Enum.intersperse([", "])
       |> List.flatten()
 
-    {q, text} = render(q, %Fragment{parts: [ident(name), "("] ++ parts ++ [")"]})
+    # `:"context.retrieve"`: an extension's procedure, each part an identifier.
+    qualified = name |> Atom.to_string() |> String.split(".") |> Enum.map_join(".", &ident/1)
+    {q, text} = render(q, %Fragment{parts: [qualified, "("] ++ parts ++ [")"]})
     %{q | call: text}
   end
 

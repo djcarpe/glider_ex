@@ -49,6 +49,7 @@ mix test
 | `Glider.graph/3` | just the `%{nodes: _, edges: _}` projection |
 | `Glider.transaction/2`, `Glider.rollback/2` | group statements; abandon them |
 | `Glider.schema/1` | labels, relationship types, indexes, with counts |
+| `Glider.extensions/1`, `create_extension/2`, `drop_extension/2` | engine extensions this build has and this database installed |
 | `Glider.expand/3` | neighbours of one node, both directions |
 | `Glider.import_jsonl/2`, `Glider.export_jsonl/1` | bulk load and dump |
 | `Glider.stats/1` | node, edge, label and index counts |
@@ -113,6 +114,31 @@ call(:pagerank, iterations: 20, top: 10) |> Glider.query!(db)
 `Glider.Query.to_cypher/1` shows the text and parameters a query sends. Where
 an expression has no Elixir spelling, `fragment("p.score * ? > 10", ^k)` drops
 to raw Cypher with pinned values.
+
+## Context for language models
+
+`Glider.Context` wraps the engine's `context` extension: full-text search for
+entry points, a relevance-ranked connected subgraph that fits a token budget,
+path explanations and a schema card, in a compact text form.
+
+```elixir
+:ok = Glider.Context.install(db)
+{:ok, _summary} = Glider.Context.index(db)          # optional: makes search an index lookup
+{:ok, card} = Glider.Context.schema(db)             # for the system prompt
+
+{:ok, ctx} = Glider.Context.retrieve(db, query: "Ada Lovelace", budget: 1500)
+ctx.text      #=> "# context: 4 nodes, 4 edges; seeds n1\nn1:Person name=\"Ada Lovelace\" ..."
+ctx.refs      #=> ["n1", "n2", "n3", "n5"]
+
+# a follow-up spends its budget on what the model has not seen yet
+{:ok, more} = Glider.Context.retrieve(db, seeds: ["n2"], seen: ctx.refs, budget: 800)
+{:ok, why} = Glider.Context.paths(db, "n1", "n9")
+```
+
+The functions work in queries too: `RETURN context.card(p)`, and
+`call(:"context.search", query: "...")` in `Glider.Query`. Arguments are
+passed as parameters and checked against the procedure's; see glider's
+`docs/EXTENSIONS.md` for all of them.
 
 ## Transactions
 

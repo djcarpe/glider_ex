@@ -432,6 +432,46 @@ defmodule Glider do
   @spec export_jsonl(db()) :: {:ok, String.t()} | {:error, String.t()}
   def export_jsonl(db), do: instrument(:export, %{db: db}, fn -> Native.export_jsonl(db) end)
 
+  @doc """
+  Extensions available in this build and whether this database installed
+  them: `[%{name: "context", available: "1.0", installed: "1.0", summary: "..."}]`.
+  """
+  @spec extensions(db()) :: {:ok, [map()]} | {:error, String.t()}
+  def extensions(db) do
+    with {:ok, r} <- query(db, "SHOW EXTENSIONS") do
+      {:ok,
+       Enum.map(r.rows, fn [name, available, installed, summary] ->
+         %{name: name, available: available, installed: installed, summary: summary}
+       end)}
+    end
+  end
+
+  @doc """
+  Install an extension in this database (`CREATE EXTENSION IF NOT EXISTS`).
+  Logged and transactional like any write. See `Glider.Context` for the
+  built-in `context` extension.
+  """
+  @spec create_extension(db(), String.t()) :: :ok | {:error, String.t()}
+  def create_extension(db, name) when is_binary(name) do
+    with {:ok, n} <- ext_name(name),
+         {:ok, _} <- query(db, "CREATE EXTENSION IF NOT EXISTS #{n}"),
+         do: :ok
+  end
+
+  @doc "Uninstall an extension, deleting what it stored (`DROP EXTENSION IF EXISTS`)."
+  @spec drop_extension(db(), String.t()) :: :ok | {:error, String.t()}
+  def drop_extension(db, name) when is_binary(name) do
+    with {:ok, n} <- ext_name(name),
+         {:ok, _} <- query(db, "DROP EXTENSION IF EXISTS #{n}"),
+         do: :ok
+  end
+
+  defp ext_name(name) do
+    if name =~ ~r/^[A-Za-z_][A-Za-z0-9_]*$/,
+      do: {:ok, name},
+      else: {:error, "not an extension name: #{inspect(name)}"}
+  end
+
   @doc "Node, edge, label and index counts, as a map."
   @spec stats(db()) :: {:ok, map()} | {:error, String.t()}
   def stats(db) do
