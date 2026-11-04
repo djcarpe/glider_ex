@@ -34,8 +34,8 @@
 //! NIF call may land on a different dirty scheduler thread, and the engine
 //! keeps "last statement" per thread.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,8 @@ use glider::api::{self, Entity};
 use glider::graph::{Dir, Graph, OpenOptions};
 use glider::query::{self, QueryResult};
 use glider::store::Sync as GliderSync;
+use glider::stream::config::{self as stream_config, ReplicaConfig};
+use glider::stream::paged::{self, PagedReplicator};
 use glider::telemetry::{self, DbMetrics, OpReport};
 use glider::value::Value;
 
@@ -751,6 +753,201 @@ fn migrate(path: String) -> Result<(u64, u64), String> {
     let _ = std::fs::remove_file(format!("{tmp}.lock"));
     let _ = std::fs::remove_file(format!("{path}.lock"));
     Ok((n, e))
+}
+
+// ------------------------------------------------------------- replication
+//
+// glider-stream's paged replication (glider's src/stream/paged.rs): base
+// snapshots plus the write-ahead log, uploaded to S3, a directory or an exec:
+// command, and restored from there. Every call does network or disk I/O and
+// can take a while, so all of them run on the dirty I/O schedulers. Options
+// arrive as a map with string keys (never atoms; see 3. above).
+
+fn opt_str(opts: &HashMap<String, Term>, k: &str) -> Option<String> {
+    opts.get(k).and_then(|t| t.decode::<String>().ok()).filter(|s| !s.is_empty())
+}
+
+fn opt_u64(opts: &HashMap<String, Term>, k: &str) -> Option<u64> {
+    opts.get(k).and_then(|t| t.decode::<u64>().ok())
+}
+
+fn opt_bool(opts: &HashMap<String, Term>, k: &str) -> Option<bool> {
+    opts.get(k).and_then(|t| t.decode::<bool>().ok())
+}
+
+fn replica_config(url: &str, opts: &HashMap<String, Term>) -> ReplicaConfig {
+    let mut rc = ReplicaConfig {
+        url: url.to_string(),
+        min_bytes: 0,
+        ..ReplicaConfig::default()
+    };
+    rc.endpoint = opt_str(opts, "endpoint");
+    if let Some(r) = opt_str(opts, "region") {
+        rc.region = r;
+    }
+    rc.access_key = opt_str(opts, "access_key_id");
+    rc.secret_key = opt_str(opts, "secret_access_key");
+    rc.spool = opt_str(opts, "spool");
+    if let Some(n) = opt_u64(opts, "min_bytes") {
+        rc.min_bytes = n;
+    }
+    if let Some(s) = opt_u64(opts, "snapshot_interval") {
+        rc.snapshot_interval = Duration::from_secs(s);
+    }
+    if let Some(s) = opt_u64(opts, "retention") {
+        rc.retention = Duration::from_secs(s);
+    }
+    if let Some(b) = opt_bool(opts, "retention_enabled") {
+        rc.retention_enabled = b;
+    }
+    rc
+}
+
+fn paged_replicator(db: &str, url: &str, opts: &HashMap<String, Term>) -> Result<PagedReplicator, String> {
+    if !glider::replica::is_paged(Path::new(db)) {
+        return Err(format!(
+            "{db} is not a paged database (files from before paged storage replicate with glider-stream)"
+        ));
+    }
+    let rc = replica_config(url, opts);
+    let spool = rc
+        .spool
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paged::default_spool(Path::new(db), url));
+    let backend = stream_config::open_backend(&rc).map_err(|e| e.to_string())?;
+    Ok(PagedReplicator::new(Path::new(db), spool, backend, rc))
+}
+
+fn backend_for(url: &str, opts: &HashMap<String, Term>) -> Result<std::sync::Arc<dyn glider::stream::backend::Backend>, String> {
+    stream_config::open_backend(&replica_config(url, opts)).map_err(|e| e.to_string())
+}
+
+/// One replication pass over a paged database file: the tailer ships into
+/// the spool, then what it completed is uploaded. With `force_snapshot` a new
+/// base is taken now; with `enforce_retention` retention runs afterwards.
+/// A writer holding the file open in this VM must poll for replication while
+/// a base is copied (`Glider.Replication.sync/3` does, given `db:`).
+#[rustler::nif(schedule = "DirtyIo")]
+fn replication_sync<'a>(
+    env: Env<'a>,
+    db: String,
+    url: String,
+    opts: HashMap<String, Term<'a>>,
+    force_snapshot: bool,
+    enforce_retention: bool,
+) -> Result<Term<'a>, String> {
+    let r = paged_replicator(&db, &url, &opts)?;
+    let s = r.sync(force_snapshot, enforce_retention).map_err(|e| e.to_string())?;
+    let lag = r.lag(&s.generation).ok();
+    Ok(map_term(
+        env,
+        vec![
+            ("generation", s.generation.encode(env)),
+            ("bases_uploaded", s.bases_uploaded.encode(env)),
+            ("segments_uploaded", s.segments_uploaded.encode(env)),
+            ("bytes", s.bytes.encode(env)),
+            ("deleted", s.deleted.encode(env)),
+            ("lag_bytes", opt_term(env, lag)),
+        ],
+    ))
+}
+
+/// Delete bases, log and idle generations past the retention period.
+#[rustler::nif(schedule = "DirtyIo")]
+fn replication_enforce_retention(db: String, url: String, opts: HashMap<String, Term>) -> Result<usize, String> {
+    paged_replicator(&db, &url, &opts)?.enforce_retention().map_err(|e| e.to_string())
+}
+
+/// Committed log not yet in the backend, in bytes.
+#[rustler::nif(schedule = "DirtyIo")]
+fn replication_lag(db: String, url: String, opts: HashMap<String, Term>) -> Result<u64, String> {
+    let r = paged_replicator(&db, &url, &opts)?;
+    let gen = glider::replica::generation_hex(Path::new(&db)).map_err(|e| e.to_string())?;
+    r.lag(&gen).map_err(|e| e.to_string())
+}
+
+/// Rebuild a paged database at `out` from the newest base at or before
+/// `as_of` (unix seconds; nil for now) and the log after it. Open the result
+/// to finish: opening replays the log.
+#[rustler::nif(schedule = "DirtyIo")]
+fn replication_restore<'a>(
+    env: Env<'a>,
+    url: String,
+    out: String,
+    generation: Option<String>,
+    as_of: Option<u64>,
+    opts: HashMap<String, Term<'a>>,
+) -> Result<Term<'a>, String> {
+    if Path::new(&out).exists() {
+        return Err(format!("{out} already exists; refusing to overwrite"));
+    }
+    let backend = backend_for(&url, &opts)?;
+    let r = paged::restore(backend.as_ref(), generation.as_deref(), as_of, Path::new(&out)).map_err(|e| e.to_string())?;
+    Ok(map_term(
+        env,
+        vec![
+            ("generation", r.generation.encode(env)),
+            ("base_lsn", r.base.lsn.encode(env)),
+            ("base_ts", r.base.ts.encode(env)),
+            ("segments", r.segments.encode(env)),
+            ("through", r.through.encode(env)),
+        ],
+    ))
+}
+
+/// Generations of paged replicas in the backend, least recently active first.
+#[rustler::nif(schedule = "DirtyIo")]
+fn replication_generations(url: String, opts: HashMap<String, Term>) -> Result<Vec<String>, String> {
+    let backend = backend_for(&url, &opts)?;
+    paged::generations(backend.as_ref()).map_err(|e| e.to_string())
+}
+
+/// What the backend holds for one generation.
+#[rustler::nif(schedule = "DirtyIo")]
+fn replication_listing<'a>(env: Env<'a>, url: String, generation: String, opts: HashMap<String, Term<'a>>) -> Result<Term<'a>, String> {
+    let backend = backend_for(&url, &opts)?;
+    let l = paged::listing(backend.as_ref(), &generation).map_err(|e| e.to_string())?;
+    let bases: Vec<Term<'a>> = l
+        .bases
+        .iter()
+        .map(|b| {
+            map_term(
+                env,
+                vec![
+                    ("lsn", b.lsn.encode(env)),
+                    ("epoch", b.epoch.encode(env)),
+                    ("ts", b.ts.encode(env)),
+                    ("bytes", b.bytes.encode(env)),
+                ],
+            )
+        })
+        .collect();
+    let segments: Vec<Term<'a>> = l
+        .segments
+        .iter()
+        .map(|s| {
+            map_term(
+                env,
+                vec![
+                    ("offset", s.seg.offset.encode(env)),
+                    ("len", s.seg.len.encode(env)),
+                    ("ts", s.seg.ts.encode(env)),
+                ],
+            )
+        })
+        .collect();
+    Ok(map_term(
+        env,
+        vec![
+            ("generation", l.generation.encode(env)),
+            ("bases", bases.encode(env)),
+            ("segments", segments.encode(env)),
+            ("complete_to", l.complete_to().encode(env)),
+            ("log_bytes", l.log_bytes().encode(env)),
+            ("last_ts", l.last_ts().encode(env)),
+        ],
+    ))
 }
 
 rustler::init!("Elixir.Glider.Native");

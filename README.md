@@ -210,6 +210,35 @@ file; a second `open/2` returns `{:error, reason}` until the first calls
 
 Sizes are bytes, or strings like `"256M"` and `"4G"`.
 
+## Replication
+
+A paged database replicates to S3, a directory or an `exec:` command as base
+snapshots plus the write-ahead log (glider-stream's paged replication; see
+glider's `docs/STREAM.md`), and restores from there to any point in time:
+
+```elixir
+s3 = [endpoint: "http://minio.internal:9000"]   # keys from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+
+{:ok, db} = Glider.open("app.gldb")
+{:ok, %{bases_uploaded: 1}} = Glider.Replication.sync("app.gldb", "s3://graphs/app", [db: db] ++ s3)
+
+# or keep it replicated, under a supervisor
+{Glider.Replicator, path: "app.gldb", url: "s3://graphs/app", db: db, interval: 1_000, endpoint: "http://minio.internal:9000"}
+
+{:ok, _report} = Glider.Replication.restore("s3://graphs/app", "restored.gldb", s3)
+{:ok, _report} = Glider.Replication.restore("s3://graphs/app", "yesterday.gldb", [as_of: System.os_time(:second) - 86_400] ++ s3)
+{:ok, back} = Glider.open("restored.gldb")                     # opening replays the log
+```
+
+A base is copied from a checkpoint the writer holds in place for the copy,
+which it notices at its next commit or when polled: pass the open handle as
+`db:` and the pass polls it. Each pass ships into a local spool first and
+uploads what is complete (a base's `base.json` last); a failed upload stays
+pending for the next pass. `generations/2`, `listing/3`, `lag/3` and
+`enforce_retention/3` look at and tidy a replica; every pass emits
+`[:glider, :replication, :sync]` telemetry with the bytes, bases, segments,
+lag and duration.
+
 ## Writing queries in Elixir source
 
 Use a plain string, or a heredoc sigil. **Do not use the bracket sigils**:
@@ -283,6 +312,8 @@ lib/glider/query.ex        Glider.Query, the composable query builder
 lib/glider/structs.ex      %Glider.Node{}, %Glider.Rel{}, %Glider.Result{}
 lib/glider/telemetry.ex    events, engine metrics, the native OTLP exporter
 lib/glider/open_telemetry.ex  OpenTelemetry spans from the events
+lib/glider/replication.ex  Glider.Replication: S3/dir replication and restore
+lib/glider/replicator.ex   Glider.Replicator, a pass on a schedule
 lib/glider/native.ex       raw NIF surface (private)
 native/glider_nif/         the Rustler crate
 ```
