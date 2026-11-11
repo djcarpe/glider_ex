@@ -21,6 +21,10 @@ defmodule Glider.OpenTelemetry do
   `setup/1` returns `{:error, :opentelemetry_not_loaded}` and glider runs as
   before.
 
+  A process that sets `Process.put({Glider.OpenTelemetry, :quiet}, true)`
+  gets no spans until it deletes the key again: for bulk work (thousands of
+  statements applying one replicated change) measured as a whole elsewhere.
+
   Options:
 
     * `:query_text` - record statements as `db.query.text`. Default `true`.
@@ -51,17 +55,7 @@ defmodule Glider.OpenTelemetry do
 
   @doc false
   def handle_event([:glider, kind, :start], _measurements, meta, config) do
-    parent = :otel_ctx.get_current()
-    tracer = :opentelemetry.get_tracer(:glider_ex)
-
-    span =
-      :otel_tracer.start_span(tracer, "glider #{kind}", %{
-        kind: :client,
-        attributes: start_attributes(kind, meta, config)
-      })
-
-    :otel_tracer.set_current_span(span)
-    Process.put({__MODULE__, meta.telemetry_span_context}, {parent, span})
+    unless Process.get({__MODULE__, :quiet}), do: start_span(kind, meta, config)
   end
 
   def handle_event([:glider, _kind, :stop], measurements, meta, _config) do
@@ -83,6 +77,20 @@ defmodule Glider.OpenTelemetry do
       :otel_span.set_status(span, :opentelemetry.status(:error, describe(meta.reason)))
       finish(span, parent)
     end
+  end
+
+  defp start_span(kind, meta, config) do
+    parent = :otel_ctx.get_current()
+    tracer = :opentelemetry.get_tracer(:glider_ex)
+
+    span =
+      :otel_tracer.start_span(tracer, "glider #{kind}", %{
+        kind: :client,
+        attributes: start_attributes(kind, meta, config)
+      })
+
+    :otel_tracer.set_current_span(span)
+    Process.put({__MODULE__, meta.telemetry_span_context}, {parent, span})
   end
 
   defp finish(span, parent) do

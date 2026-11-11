@@ -147,10 +147,10 @@ defmodule Glider do
   Options:
 
     * `:sync` - `:always`, `:normal` (default) or `:off`.
-    * `:cache_size` - page cache (a `t:size/0`, default 1G). RAM use stays
-      near this however large the database grows.
+    * `:cache_size` - per-database cache ceiling, within the shared process
+      cache budget. Defaults to the process cache budget.
     * `:work_mem` - memory algorithms may use before spilling to disk
-      (default 256M).
+      (default at most 32 MiB, admitted from the shared workspace).
     * `:checkpoint` - fold the write-ahead log into the pages after this much
       log (default 256M), or `:off`.
 
@@ -248,6 +248,116 @@ defmodule Glider do
   end
 
   @doc """
+  Query with explicit result caps and optional graph projection.
+
+  Options: `:max_rows` (10,000), `:max_bytes` (8 MiB), `:graph` (false).
+  Exceeding a cap returns an error; use `stream/4` to consume larger results.
+  Native work_mem and the shared process workspace remain upper bounds.
+  """
+  def query(db, %Query{} = q, params, opts) do
+    {cypher, own} = Query.to_cypher(q)
+    query(db, cypher, Map.merge(own, stringify(params)), opts)
+  end
+
+  def query(db, q, params, opts) when is_binary(q) and is_list(opts) do
+    with {:ok, result} <-
+           Native.query_bounded(
+             db,
+             q,
+             Map.to_list(stringify(params)),
+             Keyword.get(opts, :max_rows, 10_000),
+             bytes(Keyword.get(opts, :max_bytes, 8 <<< 20)),
+             Keyword.get(opts, :graph, false)
+           ) do
+      {:ok, to_result(result)}
+    end
+  end
+
+  @doc "Process-wide cgroup budget and live cache/workspace usage, all in bytes."
+  def memory_budget, do: Native.memory_budget()
+
+  @doc "Shrink or restore the shared cache within its boot budget; returns retained bytes."
+  def resize_cache(size), do: Native.resize_cache(bytes(size))
+
+  @doc """
+  Open a disk-spooled read cursor. Options: `:max_rows` (1,000 per batch) and
+  `:max_bytes` (1 MiB per batch). Values are captured at open. Sorting,
+  aggregation and DISTINCT must fit work_mem; plain RETURN streams to disk.
+  The cursor releases the database lock before returning. Close after use.
+  """
+  def cursor(db, q, params \\ [], opts \\ []) do
+    Native.cursor_open(
+      db,
+      q,
+      Map.to_list(stringify(params)),
+      Keyword.get(opts, :max_rows, 1000),
+      bytes(Keyword.get(opts, :max_bytes, 1 <<< 20))
+    )
+  end
+
+  @doc "Fetch one capped cursor batch as `{:ok, {result, done?}}`."
+  def cursor_next(cursor) do
+    with {:ok, {result, done?}} <- Native.cursor_next(cursor) do
+      {:ok, {to_result(result), done?}}
+    end
+  end
+
+  @doc "Close a cursor and remove its spool. Idempotent; GC also closes abandoned cursors."
+  def cursor_close(cursor), do: Native.cursor_close(cursor)
+
+  @doc """
+  Enumerate capped result batches. The cursor is closed on completion, error
+  or early halt. No full result list is retained by the stream.
+  """
+  def stream(db, q, params \\ [], opts \\ []) do
+    Stream.resource(
+      fn ->
+        case cursor(db, q, params, opts) do
+          {:ok, cursor} -> {:active, cursor}
+          {:error, reason} -> raise Glider.Error, message: reason, query: q
+        end
+      end,
+      fn
+        {:done, cursor} ->
+          {:halt, {:done, cursor}}
+
+        {:active, cursor} ->
+          case cursor_next(cursor) do
+            {:ok, {batch, true}} -> {[batch], {:done, cursor}}
+            {:ok, {batch, false}} -> {[batch], {:active, cursor}}
+            {:error, reason} -> raise Glider.Error, message: reason, query: q
+          end
+      end,
+      fn {_, cursor} -> cursor_close(cursor) end
+    )
+  end
+
+  @doc "Stream JSONL to a new server-side file; refuses to overwrite an existing file."
+  def export_file(db, path), do: Native.export_file(db, path)
+
+  @doc """
+  Stream JSONL from a server-side file. Keys and ids are remapped on disk.
+  `:max_record_bytes` defaults to 1 MiB, bounded by work_mem. Each 1,000-op
+  slice commits atomically; an error rolls back the current slice.
+  """
+  def import_file(db, path, opts \\ []) do
+    case Native.import_file(db, path, bytes(Keyword.get(opts, :max_record_bytes, 1 <<< 20))) do
+      {:ok, {nodes, edges}} -> {:ok, %{nodes: nodes, edges: edges}}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc """
+  Apply one atomic slice of at most 1,000 `{cypher, params}` writes. One native
+  call and one commit per slice. Errors roll back the whole slice. Call between
+  slices to allow queries through; explicit transaction controls are rejected.
+  """
+  def write_batch(db, statements) when is_list(statements) and length(statements) <= 1000 do
+    statements = Enum.map(statements, fn {q, params} -> {q, Map.to_list(stringify(params))} end)
+    Native.write_batch(db, statements)
+  end
+
+  @doc """
   Run a query, raising `Glider.Error` on failure.
   """
   @spec query!(db(), queryable(), params()) :: Result.t()
@@ -328,7 +438,7 @@ defmodule Glider do
   def graph(%Query{} = q, db, params) when is_reference(db), do: graph(db, q, params)
 
   def graph(db, q, params) do
-    with {:ok, r} <- query(db, q, params), do: {:ok, r.graph}
+    with {:ok, r} <- query(db, q, params, graph: true), do: {:ok, r.graph}
   end
 
   @doc """
