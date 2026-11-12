@@ -234,7 +234,10 @@ defmodule GliderTest do
 
     test "lists, nil and booleans round-trip" do
       {:ok, db} = Glider.open()
-      {:ok, _} = Glider.run(db, "CREATE (:T {xs: $xs, b: $b, n: $n})", xs: [1, 2, 3], b: true, n: nil)
+
+      {:ok, _} =
+        Glider.run(db, "CREATE (:T {xs: $xs, b: $b, n: $n})", xs: [1, 2, 3], b: true, n: nil)
+
       assert [[[1, 2, 3], true]] = Glider.all(db, "MATCH (t:T) RETURN t.xs, t.b")
     end
 
@@ -379,6 +382,33 @@ defmodule GliderTest do
       assert length(r.rows) == 2
       assert [_name, rank] = hd(r.rows)
       assert is_float(rank)
+    end
+
+    test "levels and reduce of a DAG" do
+      {:ok, db} = Glider.open()
+
+      Glider.run!(
+        db,
+        "CREATE (a:S {n: 'a'}), (b:S {n: 'b'}), (c:S {n: 'c'}), " <>
+          "(a)-[:BEFORE]->(b), (b)-[:BEFORE]->(c), (a)-[:BEFORE]->(c)"
+      )
+
+      {:ok, _} = Glider.query(db, ~S|CALL levels(write: "level")|)
+      {:ok, r} = Glider.query(db, "MATCH (s:S) RETURN s.n, s.level ORDER BY s.n")
+      assert r.rows == [["a", 0], ["b", 1], ["c", 2]]
+
+      # a -> c is implied by a -> b -> c
+      {:ok, implied} = Glider.query(db, "CALL reduce()")
+      assert [[_edge, from, to, "BEFORE"]] = implied.rows
+
+      {:ok, ends} =
+        Glider.query(db, "MATCH (s:S) WHERE s.n IN ['a', 'c'] RETURN s.n, id(s) ORDER BY s.n")
+
+      assert [["a", from], ["c", to]] == ends.rows
+
+      Glider.run!(db, "MATCH (c:S {n: 'c'}), (a:S {n: 'a'}) CREATE (c)-[:BEFORE]->(a)")
+      assert {:error, reason} = Glider.query(db, "CALL levels()")
+      assert reason =~ "cycle"
     end
   end
 
