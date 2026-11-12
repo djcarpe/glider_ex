@@ -22,3 +22,8 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 glider_ex-*.tar
 
+
+# Cargo build output of the NIF.
+/native/glider_nif/target/
+# The rlib Rustler copies beside the NIF; nothing loads it.
+/priv/native/glider.so
