@@ -36,10 +36,11 @@ defmodule Glider.Result do
   @moduledoc """
   The result of a query.
 
-  `graph` holds every node and relationship that appeared in `rows`,
+  When requested with `Glider.query/4` and `graph: true`, `graph` holds
+  every node and relationship that appeared in `rows`,
   deduplicated, with the endpoints of any returned relationship pulled in so
   the set is always drawable. That means `MATCH ()-[r]->() RETURN r` still
-  gives you both endpoints without asking for them.
+  gives you both endpoints. The default projection is empty.
   """
 
   @type t :: %__MODULE__{

@@ -39,7 +39,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use rustler::{Atom, Encoder, Env, LocalPid, Monitor, Resource, ResourceArc, Term, TermType};
+use rustler::{
+    Atom, Binary, Encoder, Env, LocalPid, Monitor, Resource, ResourceArc, Term, TermType,
+};
 
 use glider::api::{self, Entity};
 use glider::graph::{Dir, Graph, OpenOptions};
@@ -168,7 +170,11 @@ fn new_handle(graph: Graph) -> ResourceArc<DbResource> {
 /// An Elixir term as a glider value: nil, booleans, integers, floats,
 /// binaries and lists of those. Anything else is refused rather than
 /// guessed at.
-fn term_value(t: Term) -> Result<Value, String> {
+fn term_value(t: Term, remaining: &mut u64, depth: usize) -> Result<Value, String> {
+    if depth > 64 || *remaining < 64 {
+        return Err("parameter work_mem exceeded".into());
+    }
+    *remaining -= 64;
     match t.get_type() {
         TermType::Atom => {
             if t == atoms::nil().encode(t.get_env()) {
@@ -183,24 +189,58 @@ fn term_value(t: Term) -> Result<Value, String> {
             .decode::<i64>()
             .map(Value::Int)
             .map_err(|_| "integer parameter out of 64-bit range".to_string()),
-        TermType::Float => t.decode::<f64>().map(Value::Float).map_err(|_| "bad float".into()),
-        TermType::Binary => t
-            .decode::<String>()
-            .map(Value::Text)
-            .map_err(|_| "binary parameter is not valid UTF-8".to_string()),
+        TermType::Float => t
+            .decode::<f64>()
+            .map(Value::Float)
+            .map_err(|_| "bad float".into()),
+        TermType::Binary => {
+            let bytes = t.decode::<Binary>().map_err(|_| "bad binary")?;
+            if bytes.len() as u64 > *remaining {
+                return Err("parameter work_mem exceeded".into());
+            }
+            *remaining -= bytes.len() as u64;
+            std::str::from_utf8(bytes.as_slice())
+                .map(|s| Value::Text(s.to_owned()))
+                .map_err(|_| "binary parameter is not valid UTF-8".into())
+        }
         TermType::List => {
-            let items: Vec<Term> = t.decode().map_err(|_| "bad list")?;
-            items.into_iter().map(term_value).collect::<Result<Vec<_>, _>>().map(Value::List)
+            let items: rustler::types::list::ListIterator = t.decode().map_err(|_| "bad list")?;
+            let mut values = Vec::new();
+            for item in items {
+                values.push(term_value(item, remaining, depth + 1)?);
+            }
+            Ok(Value::List(values))
         }
         other => Err(format!("unsupported parameter value ({other:?})")),
     }
 }
 
-fn params_of(params: Vec<(String, Term)>) -> Result<Vec<(String, Value)>, String> {
-    params
-        .into_iter()
-        .map(|(k, v)| term_value(v).map(|v| (k, v)))
-        .collect()
+fn params_of(params: Term, remaining: &mut u64) -> Result<Vec<(String, Value)>, String> {
+    let items: rustler::types::list::ListIterator =
+        params.decode().map_err(|_| "bad parameters")?;
+    let mut out = Vec::new();
+    for item in items {
+        if out.len() >= 1000 {
+            return Err("too many query parameters".into());
+        }
+        let (key, value): (Binary, Term) = item.decode().map_err(|_| "bad parameter pair")?;
+        if key.len() > 1024 || key.len() as u64 > *remaining {
+            return Err("parameter name too long".into());
+        }
+        *remaining -= key.len() as u64;
+        let key = std::str::from_utf8(key.as_slice())
+            .map_err(|_| "parameter name is not UTF-8")?
+            .to_owned();
+        out.push((key, term_value(value, remaining, 0)?));
+    }
+    Ok(out)
+}
+
+fn source_of<'a>(binary: Binary<'a>) -> Result<&'a str, String> {
+    if binary.len() > 1 << 20 {
+        return Err("query source exceeds work_mem".into());
+    }
+    std::str::from_utf8(binary.as_slice()).map_err(|_| "query is not UTF-8".into())
 }
 
 // -------------------------------------------------------------------- terms
@@ -353,10 +393,32 @@ fn db_metrics_term<'a>(env: Env<'a>, name: &str, m: &DbMetrics) -> Term<'a> {
 
 /// Turn a QueryResult into the map Elixir wraps as `%Glider.Result{}`,
 /// including the deduplicated graph projection.
-fn result_term<'a>(env: Env<'a>, g: &Graph, r: &QueryResult) -> Term<'a> {
+fn result_term<'a>(env: Env<'a>, g: &Graph, r: &QueryResult, projection: bool, max_bytes: u64) -> Result<Term<'a>, String> {
     let mut node_ids: BTreeSet<u64> = BTreeSet::new();
     let mut edge_ids: BTreeSet<u64> = BTreeSet::new();
 
+    // Preflight the optional endpoint projection before creating BEAM terms.
+    let mut used = r.rows.iter().map(|row| query::row_bytes(row)).sum::<u64>();
+    if projection {
+        for value in r.rows.iter().flatten() {
+            match api::classify(g, value) {
+                Some(Entity::Node(id)) => { node_ids.insert(id); }
+                Some(Entity::Edge(id)) => { edge_ids.insert(id); }
+                None => {}
+            }
+        }
+        for id in &edge_ids {
+            if let Some(edge) = g.edge(*id) { node_ids.insert(edge.from); node_ids.insert(edge.to); }
+        }
+        for id in &node_ids {
+            used = used.saturating_add(query::node_value(g, *id).memory_bytes().saturating_mul(2));
+            if used > max_bytes { return Err("graph projection exceeds result byte cap".into()); }
+        }
+        for id in &edge_ids {
+            used = used.saturating_add(query::edge_value(g, *id).memory_bytes().saturating_mul(2));
+            if used > max_bytes { return Err("graph projection exceeds result byte cap".into()); }
+        }
+    }
     let rows: Vec<Term<'a>> = r
         .rows
         .iter()
@@ -365,11 +427,15 @@ fn result_term<'a>(env: Env<'a>, g: &Graph, r: &QueryResult) -> Term<'a> {
                 .iter()
                 .map(|v| match api::classify(g, v) {
                     Some(Entity::Node(id)) => {
-                        node_ids.insert(id);
+                        if projection {
+                            node_ids.insert(id);
+                        }
                         node_term(env, g, id)
                     }
                     Some(Entity::Edge(id)) => {
-                        edge_ids.insert(id);
+                        if projection {
+                            edge_ids.insert(id);
+                        }
                         rel_term(env, g, id)
                     }
                     None => value_term(env, v),
@@ -408,7 +474,271 @@ fn result_term<'a>(env: Env<'a>, g: &Graph, r: &QueryResult) -> Term<'a> {
         message,
         r.touched.encode(env),
     ];
-    Term::map_from_arrays(env, &keys, &values).expect("result map")
+    Ok(Term::map_from_arrays(env, &keys, &values).expect("result map"))
+}
+
+// Cursor entities use the values captured in the spool, even if the source
+// graph has since changed or closed. No database lock is needed to fetch.
+fn snapshot_value_term<'a>(env: Env<'a>, value: &Value) -> Term<'a> {
+    if let Value::Text(text) = value {
+        if let Ok(j) = glider::value::parse_json(text) {
+            if let Some(id) = j.get("id").and_then(|v| v.as_u64()) {
+                if let Some(glider::value::Json::Object(props)) = j.get("props") {
+                    let props = props
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.to_value()))
+                        .collect::<Vec<_>>();
+                    if let Some(glider::value::Json::Array(labels)) = j.get("labels") {
+                        let labels = labels.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>();
+                        return map_term(
+                            env,
+                            vec![
+                                ("__struct__", atom_term(env, "Elixir.Glider.Node")),
+                                ("id", id.encode(env)),
+                                ("labels", labels.encode(env)),
+                                ("props", props_term(env, &props)),
+                            ],
+                        );
+                    }
+                    if let (Some(from), Some(to), Some(kind)) = (
+                        j.get("from").and_then(|v| v.as_u64()),
+                        j.get("to").and_then(|v| v.as_u64()),
+                        j.get("type").and_then(|v| v.as_str()),
+                    ) {
+                        return map_term(
+                            env,
+                            vec![
+                                ("__struct__", atom_term(env, "Elixir.Glider.Rel")),
+                                ("id", id.encode(env)),
+                                ("from", from.encode(env)),
+                                ("to", to.encode(env)),
+                                ("type", kind.encode(env)),
+                                ("props", props_term(env, &props)),
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    value_term(env, value)
+}
+
+fn workspace(g: &Graph) -> Result<glider::budget::Lease, String> {
+    glider::budget::ensure()
+        .work
+        .lease(g.query_memory())
+        .ok_or_else(|| "busy: process query workspace budget exhausted".into())
+}
+
+struct LimitedWriter {
+    bytes: Vec<u8>,
+    max: u64,
+}
+impl std::io::Write for LimitedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if (self.bytes.len() as u64).saturating_add(bytes.len() as u64) > self.max {
+            return Err(std::io::Error::other(
+                "export exceeds work_mem; use export_file",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub struct CursorResource {
+    cursor: Mutex<Option<query::Cursor>>,
+}
+#[rustler::resource_impl]
+impl Resource for CursorResource {}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn memory_budget(env: Env) -> Term {
+    let b = glider::budget::ensure();
+    map_term(
+        env,
+        vec![
+            ("limit_bytes", b.config.limit.encode(env)),
+            ("budget_bytes", b.config.budget.encode(env)),
+            ("cache_limit_bytes", b.cache.limit().encode(env)),
+            ("cache_used_bytes", b.cache.used().encode(env)),
+            ("work_limit_bytes", b.work.limit().encode(env)),
+            ("work_used_bytes", b.work.used().encode(env)),
+            ("beam_bytes", b.config.beam.encode(env)),
+        ],
+    )
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn resize_cache(bytes: u64) -> u64 {
+    glider::budget::ensure();
+    glider::storage::pager::resize_shared_cache(bytes).unwrap_or(0)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn query_bounded<'a>(
+    env: Env<'a>,
+    db: ResourceArc<DbResource>,
+    q: Binary<'a>,
+    params: Term<'a>,
+    max_rows: usize,
+    max_bytes: u64,
+    projection: bool,
+) -> Result<Term<'a>, String> {
+    let q = source_of(q)?;
+    db.with(env.pid(), |g| {
+        let _lease = workspace(g)?;
+        let params = params_of(params, &mut (g.query_memory() / 8))?;
+        let limits = query::QueryLimits {
+            max_rows,
+            max_bytes: max_bytes.min(g.query_memory() / 4),
+        };
+        let r = query::execute_capped(g, &q, &params, limits).map_err(|e| e.to_string())?;
+        result_term(env, g, &r, projection, limits.max_bytes)
+    })
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn cursor_open(
+    env: Env,
+    db: ResourceArc<DbResource>,
+    q: Binary,
+    params: Term,
+    max_rows: usize,
+    max_bytes: u64,
+) -> Result<ResourceArc<CursorResource>, String> {
+    let q = source_of(q)?;
+    let cursor = db.with(env.pid(), |g| {
+        let _lease = workspace(g)?;
+        let params = params_of(params, &mut (g.query_memory() / 8))?;
+        query::Cursor::open(
+            g,
+            &q,
+            &params,
+            query::QueryLimits {
+                max_rows,
+                max_bytes: max_bytes.min(g.query_memory() / 4),
+            },
+        )
+        .map_err(|e| e.to_string())
+    })?;
+    Ok(ResourceArc::new(CursorResource {
+        cursor: Mutex::new(Some(cursor)),
+    }))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn cursor_next<'a>(
+    env: Env<'a>,
+    cursor: ResourceArc<CursorResource>,
+) -> Result<(Term<'a>, bool), String> {
+    let mut state = cursor.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let c = state.as_mut().ok_or("cursor is closed")?;
+    let _lease = glider::budget::ensure()
+        .work
+        .lease(c.batch_workspace())
+        .ok_or("busy: query workspace budget exhausted")?;
+    let (result, done) = c.next_batch().map_err(|e| e.to_string())?;
+    let rows = result
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| snapshot_value_term(env, v))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let empty = Vec::<Term>::new();
+    let graph = map_term(
+        env,
+        vec![("nodes", empty.encode(env)), ("edges", empty.encode(env))],
+    );
+    Ok((
+        map_term(
+            env,
+            vec![
+                ("columns", result.columns.encode(env)),
+                ("rows", rows.encode(env)),
+                ("graph", graph),
+            ],
+        ),
+        done,
+    ))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn cursor_close(cursor: ResourceArc<CursorResource>) -> Atom {
+    cursor
+        .cursor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    atoms::ok()
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn export_file(env: Env, db: ResourceArc<DbResource>, path: String) -> Result<Atom, String> {
+    db.with(env.pid(), |g| {
+        let _lease = workspace(g)?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let mut writer = std::io::BufWriter::new(file);
+        query::export_jsonl_to(g, &mut writer).map_err(|e| e.to_string())?;
+        std::io::Write::flush(&mut writer).map_err(|e| e.to_string())?;
+        Ok(atoms::ok())
+    })
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn import_file(
+    env: Env,
+    db: ResourceArc<DbResource>,
+    path: String,
+    max_record_bytes: u64,
+) -> Result<(usize, usize), String> {
+    db.with(env.pid(), |g| {
+        let _lease = workspace(g)?;
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        query::import_jsonl_from(
+            g,
+            &mut std::io::BufReader::new(file),
+            max_record_bytes.min(g.query_memory() / 8),
+        )
+        .map_err(|e| e.to_string())
+    })
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn write_batch(env: Env, db: ResourceArc<DbResource>, statements: Term) -> Result<usize, String> {
+    db.with(env.pid(), |g| {
+        let _lease = workspace(g)?;
+        let items: rustler::types::list::ListIterator =
+            statements.decode().map_err(|_| "bad write slice")?;
+        let mut remaining = g.query_memory() / 8;
+        let mut decoded = Vec::new();
+        for item in items {
+            if decoded.len() >= 1000 {
+                return Err("write slice exceeds 1000 statements".into());
+            }
+            let (q, params): (Binary, Term) = item.decode().map_err(|_| "bad write pair")?;
+            let q = source_of(q)?;
+            // Account for both the source and parsed AST before making a copy.
+            let charge = q.len() as u64 * 32;
+            if charge > remaining {
+                return Err("write slice exceeds work_mem".into());
+            }
+            remaining -= charge;
+            decoded.push((q.to_owned(), params_of(params, &mut remaining)?));
+        }
+        query::execute_batch(g, &decoded).map_err(|e| e.to_string())
+    })
 }
 
 // --------------------------------------------------------------------- NIFs
@@ -417,11 +747,14 @@ fn result_term<'a>(env: Env<'a>, g: &Graph, r: &QueryResult) -> Term<'a> {
 /// Past the limit, writes fail with "graph is full" and roll back.
 #[rustler::nif]
 fn open_memory(max_bytes: u64) -> ResourceArc<DbResource> {
-    new_handle(if max_bytes == 0 {
-        Graph::memory()
+    let budget = glider::budget::ensure();
+    let mut g = Graph::memory_with_limit(if max_bytes == 0 {
+        budget.config.beam
     } else {
-        Graph::memory_with_limit(max_bytes)
-    })
+        max_bytes.min(budget.config.beam)
+    });
+    g.set_work_mem((32 << 20).min(budget.config.work / 2));
+    new_handle(g)
 }
 
 /// Opening reads a superblock and replays whatever log a crash left, which
@@ -441,12 +774,25 @@ fn open_file(
     } else {
         GliderSync::Normal
     };
+    let budget = glider::budget::ensure();
     let d = OpenOptions::default();
     let opts = OpenOptions {
         sync: mode,
-        cache_size: if cache_size == 0 { d.cache_size } else { cache_size },
-        work_mem: if work_mem == 0 { d.work_mem } else { work_mem },
-        checkpoint_bytes: if checkpoint_bytes == 0 { d.checkpoint_bytes } else { checkpoint_bytes },
+        cache_size: if cache_size == 0 {
+            budget.config.cache
+        } else {
+            cache_size.min(budget.config.cache)
+        },
+        work_mem: if work_mem == 0 {
+            (32 << 20).min(budget.config.work / 2)
+        } else {
+            work_mem.min(budget.config.work / 2)
+        },
+        checkpoint_bytes: if checkpoint_bytes == 0 {
+            d.checkpoint_bytes
+        } else {
+            checkpoint_bytes
+        },
         ..d
     };
     let graph = Graph::open_opts(Path::new(&path), opts).map_err(|e| e.to_string())?;
@@ -463,16 +809,20 @@ fn open_file(
 fn query<'a>(
     env: Env<'a>,
     db: ResourceArc<DbResource>,
-    q: String,
-    params: Vec<(String, Term<'a>)>,
+    q: Binary<'a>,
+    params: Term<'a>,
 ) -> Result<(Term<'a>, Term<'a>), (String, Term<'a>)> {
     let nil = atoms::nil().encode(env);
-    let params = params_of(params).map_err(|e| (e, nil))?;
+    let q = source_of(q).map_err(|e| (e, nil))?;
     let mut ran = None;
     let out = db.with(env.pid(), |g| {
         ran = Some(g.telemetry_name());
-        let r = query::execute_with(g, &q, &params).map_err(|e| e.to_string())?;
-        Ok(result_term(env, g, &r))
+        let _lease = workspace(g)?;
+        let params = params_of(params, &mut (g.query_memory() / 8))?;
+        let limits = query::QueryLimits { max_bytes: (8 << 20).min(g.query_memory()/4), ..Default::default() };
+        let r = query::execute_capped(g, &q, &params, limits)
+            .map_err(|e| e.to_string())?;
+        result_term(env, g, &r, false, g.query_memory() / 4)
     });
     // Same thread as the statement: the engine's per-thread report is ours.
     let op = match (telemetry::last_op(), ran) {
@@ -494,7 +844,16 @@ fn telemetry_snapshot(env: Env) -> Term {
     let queries: Vec<Term> = s
         .queries
         .iter()
-        .map(|(op, ok, err)| map_term(env, vec![("op", op.encode(env)), ("ok", ok.encode(env)), ("error", err.encode(env))]))
+        .map(|(op, ok, err)| {
+            map_term(
+                env,
+                vec![
+                    ("op", op.encode(env)),
+                    ("ok", ok.encode(env)),
+                    ("error", err.encode(env)),
+                ],
+            )
+        })
         .collect();
     map_term(
         env,
@@ -508,7 +867,10 @@ fn telemetry_snapshot(env: Env) -> Term {
             ("page_misses", s.page_misses.encode(env)),
             ("duration_count", s.duration_count.encode(env)),
             ("duration_sum_ns", s.duration_sum_ns.encode(env)),
-            ("duration_bounds", telemetry::DURATION_BOUNDS.to_vec().encode(env)),
+            (
+                "duration_bounds",
+                telemetry::DURATION_BOUNDS.to_vec().encode(env),
+            ),
             ("duration_buckets", s.duration_buckets.encode(env)),
         ],
     )
@@ -591,13 +953,36 @@ fn expand<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn import_jsonl(env: Env, db: ResourceArc<DbResource>, jsonl: String) -> Result<(usize, usize), String> {
-    db.with(env.pid(), |g| query::import_jsonl(g, &jsonl).map_err(|e| e.to_string()))
+fn import_jsonl(
+    env: Env,
+    db: ResourceArc<DbResource>,
+    jsonl: Binary,
+) -> Result<(usize, usize), String> {
+    db.with(env.pid(), |g| {
+        let _lease = workspace(g)?;
+        if jsonl.len() as u64 > g.query_memory() / 8 {
+            return Err("import exceeds work_mem; use import_file".into());
+        }
+        query::import_jsonl_from(
+            g,
+            &mut std::io::Cursor::new(jsonl.as_slice()),
+            (1 << 20).min(g.query_memory() / 8),
+        )
+        .map_err(|e| e.to_string())
+    })
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn export_jsonl(env: Env, db: ResourceArc<DbResource>) -> Result<String, String> {
-    db.with(env.pid(), |g| Ok(query::export_jsonl(g)))
+    db.with(env.pid(), |g| {
+        let _lease = workspace(g)?;
+        let mut writer = LimitedWriter {
+            bytes: Vec::new(),
+            max: g.query_memory() / 4,
+        };
+        query::export_jsonl_to(g, &mut writer).map_err(|e| e.to_string())?;
+        String::from_utf8(writer.bytes).map_err(|e| e.to_string())
+    })
 }
 
 /// Flushing waits on the filesystem.
@@ -657,7 +1042,9 @@ fn end_tx(env: Env, db: &ResourceArc<DbResource>, commit: bool) -> Result<Atom, 
     drop(st);
     r?;
     if commit && aborted {
-        return Err("the transaction was aborted by an earlier error and has been rolled back".into());
+        return Err(
+            "the transaction was aborted by an earlier error and has been rolled back".into(),
+        );
     }
     Ok(atoms::ok())
 }
@@ -683,7 +1070,9 @@ fn in_transaction(env: Env, db: ResourceArc<DbResource>) -> bool {
 /// (see glider's docs/REPLICATION.md).
 #[rustler::nif(schedule = "DirtyIo")]
 fn poll_replication(env: Env, db: ResourceArc<DbResource>) -> Result<Atom, String> {
-    db.with(env.pid(), |g| g.poll_replication().map_err(|e| e.to_string()))?;
+    db.with(env.pid(), |g| {
+        g.poll_replication().map_err(|e| e.to_string())
+    })?;
     Ok(atoms::ok())
 }
 
@@ -803,7 +1192,11 @@ fn replica_config(url: &str, opts: &HashMap<String, Term>) -> ReplicaConfig {
     rc
 }
 
-fn paged_replicator(db: &str, url: &str, opts: &HashMap<String, Term>) -> Result<PagedReplicator, String> {
+fn paged_replicator(
+    db: &str,
+    url: &str,
+    opts: &HashMap<String, Term>,
+) -> Result<PagedReplicator, String> {
     if !glider::replica::is_paged(Path::new(db)) {
         return Err(format!(
             "{db} is not a paged database (files from before paged storage replicate with glider-stream)"
@@ -819,7 +1212,10 @@ fn paged_replicator(db: &str, url: &str, opts: &HashMap<String, Term>) -> Result
     Ok(PagedReplicator::new(Path::new(db), spool, backend, rc))
 }
 
-fn backend_for(url: &str, opts: &HashMap<String, Term>) -> Result<std::sync::Arc<dyn glider::stream::backend::Backend>, String> {
+fn backend_for(
+    url: &str,
+    opts: &HashMap<String, Term>,
+) -> Result<std::sync::Arc<dyn glider::stream::backend::Backend>, String> {
     stream_config::open_backend(&replica_config(url, opts)).map_err(|e| e.to_string())
 }
 
@@ -855,8 +1251,14 @@ fn replication_sync<'a>(
 
 /// Delete bases, log and idle generations past the retention period.
 #[rustler::nif(schedule = "DirtyIo")]
-fn replication_enforce_retention(db: String, url: String, opts: HashMap<String, Term>) -> Result<usize, String> {
-    paged_replicator(&db, &url, &opts)?.enforce_retention().map_err(|e| e.to_string())
+fn replication_enforce_retention(
+    db: String,
+    url: String,
+    opts: HashMap<String, Term>,
+) -> Result<usize, String> {
+    paged_replicator(&db, &url, &opts)?
+        .enforce_retention()
+        .map_err(|e| e.to_string())
 }
 
 /// Committed log not yet in the backend, in bytes.
@@ -883,7 +1285,13 @@ fn replication_restore<'a>(
         return Err(format!("{out} already exists; refusing to overwrite"));
     }
     let backend = backend_for(&url, &opts)?;
-    let r = paged::restore(backend.as_ref(), generation.as_deref(), as_of, Path::new(&out)).map_err(|e| e.to_string())?;
+    let r = paged::restore(
+        backend.as_ref(),
+        generation.as_deref(),
+        as_of,
+        Path::new(&out),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(map_term(
         env,
         vec![
@@ -898,14 +1306,22 @@ fn replication_restore<'a>(
 
 /// Generations of paged replicas in the backend, least recently active first.
 #[rustler::nif(schedule = "DirtyIo")]
-fn replication_generations(url: String, opts: HashMap<String, Term>) -> Result<Vec<String>, String> {
+fn replication_generations(
+    url: String,
+    opts: HashMap<String, Term>,
+) -> Result<Vec<String>, String> {
     let backend = backend_for(&url, &opts)?;
     paged::generations(backend.as_ref()).map_err(|e| e.to_string())
 }
 
 /// What the backend holds for one generation.
 #[rustler::nif(schedule = "DirtyIo")]
-fn replication_listing<'a>(env: Env<'a>, url: String, generation: String, opts: HashMap<String, Term<'a>>) -> Result<Term<'a>, String> {
+fn replication_listing<'a>(
+    env: Env<'a>,
+    url: String,
+    generation: String,
+    opts: HashMap<String, Term<'a>>,
+) -> Result<Term<'a>, String> {
     let backend = backend_for(&url, &opts)?;
     let l = paged::listing(backend.as_ref(), &generation).map_err(|e| e.to_string())?;
     let bases: Vec<Term<'a>> = l
@@ -950,4 +1366,9 @@ fn replication_listing<'a>(env: Env<'a>, url: String, generation: String, opts: 
     ))
 }
 
-rustler::init!("Elixir.Glider.Native");
+fn load(_env: Env, _info: Term) -> bool {
+    glider::budget::ensure();
+    true
+}
+
+rustler::init!("Elixir.Glider.Native", load = load);
