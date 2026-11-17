@@ -253,6 +253,11 @@ defmodule Glider do
   Options: `:max_rows` (10,000), `:max_bytes` (8 MiB), `:graph` (false).
   Exceeding a cap returns an error; use `stream/4` to consume larger results.
   Native work_mem and the shared process workspace remain upper bounds.
+
+  The statement's own budget: `:max_millis` (how long matching may run) and
+  `:max_steps` (how many bindings it may try). Past either, the statement
+  stops with `{:error, "statement stopped: …"}` and the database is released;
+  without them it runs to its end, which nothing can interrupt.
   """
   def query(db, %Query{} = q, params, opts) do
     {cypher, own} = Query.to_cypher(q)
@@ -267,7 +272,9 @@ defmodule Glider do
              Map.to_list(stringify(params)),
              Keyword.get(opts, :max_rows, 10_000),
              bytes(Keyword.get(opts, :max_bytes, 8 <<< 20)),
-             Keyword.get(opts, :graph, false)
+             Keyword.get(opts, :graph, false),
+             budget(opts, :max_millis),
+             budget(opts, :max_steps)
            ) do
       {:ok, to_result(result)}
     end
@@ -284,6 +291,8 @@ defmodule Glider do
   `:max_bytes` (1 MiB per batch). Values are captured at open. Sorting,
   aggregation and DISTINCT must fit work_mem; plain RETURN streams to disk.
   The cursor releases the database lock before returning. Close after use.
+  `:max_millis` and `:max_steps` budget the statement as in `query/4`: the
+  open fails, releasing the database, once the budget is spent.
   """
   def cursor(db, q, params \\ [], opts \\ []) do
     Native.cursor_open(
@@ -291,8 +300,19 @@ defmodule Glider do
       q,
       Map.to_list(stringify(params)),
       Keyword.get(opts, :max_rows, 1000),
-      bytes(Keyword.get(opts, :max_bytes, 1 <<< 20))
+      bytes(Keyword.get(opts, :max_bytes, 1 <<< 20)),
+      budget(opts, :max_millis),
+      budget(opts, :max_steps)
     )
+  end
+
+  # 0 is "no budget" to the NIF
+  defp budget(opts, key) do
+    case Keyword.get(opts, key) do
+      n when is_integer(n) and n > 0 -> n
+      nil -> 0
+      other -> raise ArgumentError, "#{key} must be a positive integer, got: #{inspect(other)}"
+    end
   end
 
   @doc "Fetch one capped cursor batch as `{:ok, {result, done?}}`."

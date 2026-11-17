@@ -393,7 +393,13 @@ fn db_metrics_term<'a>(env: Env<'a>, name: &str, m: &DbMetrics) -> Term<'a> {
 
 /// Turn a QueryResult into the map Elixir wraps as `%Glider.Result{}`,
 /// including the deduplicated graph projection.
-fn result_term<'a>(env: Env<'a>, g: &Graph, r: &QueryResult, projection: bool, max_bytes: u64) -> Result<Term<'a>, String> {
+fn result_term<'a>(
+    env: Env<'a>,
+    g: &Graph,
+    r: &QueryResult,
+    projection: bool,
+    max_bytes: u64,
+) -> Result<Term<'a>, String> {
     let mut node_ids: BTreeSet<u64> = BTreeSet::new();
     let mut edge_ids: BTreeSet<u64> = BTreeSet::new();
 
@@ -402,21 +408,32 @@ fn result_term<'a>(env: Env<'a>, g: &Graph, r: &QueryResult, projection: bool, m
     if projection {
         for value in r.rows.iter().flatten() {
             match api::classify(g, value) {
-                Some(Entity::Node(id)) => { node_ids.insert(id); }
-                Some(Entity::Edge(id)) => { edge_ids.insert(id); }
+                Some(Entity::Node(id)) => {
+                    node_ids.insert(id);
+                }
+                Some(Entity::Edge(id)) => {
+                    edge_ids.insert(id);
+                }
                 None => {}
             }
         }
         for id in &edge_ids {
-            if let Some(edge) = g.edge(*id) { node_ids.insert(edge.from); node_ids.insert(edge.to); }
+            if let Some(edge) = g.edge(*id) {
+                node_ids.insert(edge.from);
+                node_ids.insert(edge.to);
+            }
         }
         for id in &node_ids {
             used = used.saturating_add(query::node_value(g, *id).memory_bytes().saturating_mul(2));
-            if used > max_bytes { return Err("graph projection exceeds result byte cap".into()); }
+            if used > max_bytes {
+                return Err("graph projection exceeds result byte cap".into());
+            }
         }
         for id in &edge_ids {
             used = used.saturating_add(query::edge_value(g, *id).memory_bytes().saturating_mul(2));
-            if used > max_bytes { return Err("graph projection exceeds result byte cap".into()); }
+            if used > max_bytes {
+                return Err("graph projection exceeds result byte cap".into());
+            }
         }
     }
     let rows: Vec<Term<'a>> = r
@@ -588,6 +605,8 @@ fn query_bounded<'a>(
     max_rows: usize,
     max_bytes: u64,
     projection: bool,
+    max_millis: u64,
+    max_steps: u64,
 ) -> Result<Term<'a>, String> {
     let q = source_of(q)?;
     db.with(env.pid(), |g| {
@@ -596,6 +615,8 @@ fn query_bounded<'a>(
         let limits = query::QueryLimits {
             max_rows,
             max_bytes: max_bytes.min(g.query_memory() / 4),
+            max_millis: (max_millis > 0).then_some(max_millis),
+            max_steps: (max_steps > 0).then_some(max_steps),
         };
         let r = query::execute_capped(g, &q, &params, limits).map_err(|e| e.to_string())?;
         result_term(env, g, &r, projection, limits.max_bytes)
@@ -610,6 +631,8 @@ fn cursor_open(
     params: Term,
     max_rows: usize,
     max_bytes: u64,
+    max_millis: u64,
+    max_steps: u64,
 ) -> Result<ResourceArc<CursorResource>, String> {
     let q = source_of(q)?;
     let cursor = db.with(env.pid(), |g| {
@@ -622,6 +645,8 @@ fn cursor_open(
             query::QueryLimits {
                 max_rows,
                 max_bytes: max_bytes.min(g.query_memory() / 4),
+                max_millis: (max_millis > 0).then_some(max_millis),
+                max_steps: (max_steps > 0).then_some(max_steps),
             },
         )
         .map_err(|e| e.to_string())
@@ -819,9 +844,11 @@ fn query<'a>(
         ran = Some(g.telemetry_name());
         let _lease = workspace(g)?;
         let params = params_of(params, &mut (g.query_memory() / 8))?;
-        let limits = query::QueryLimits { max_bytes: (8 << 20).min(g.query_memory()/4), ..Default::default() };
-        let r = query::execute_capped(g, &q, &params, limits)
-            .map_err(|e| e.to_string())?;
+        let limits = query::QueryLimits {
+            max_bytes: (8 << 20).min(g.query_memory() / 4),
+            ..Default::default()
+        };
+        let r = query::execute_capped(g, &q, &params, limits).map_err(|e| e.to_string())?;
         result_term(env, g, &r, false, g.query_memory() / 4)
     });
     // Same thread as the statement: the engine's per-thread report is ours.
@@ -883,7 +910,9 @@ fn db_list(dbs: &[ResourceArc<DbResource>]) -> Vec<(String, DbMetrics)> {
     dbs.iter()
         .filter_map(|db| {
             let st = db.lock();
-            st.graph.as_ref().map(|g| (g.telemetry_name(), g.telemetry()))
+            st.graph
+                .as_ref()
+                .map(|g| (g.telemetry_name(), g.telemetry()))
         })
         .collect()
 }
@@ -1063,7 +1092,10 @@ fn rollback(env: Env, db: ResourceArc<DbResource>) -> Result<Atom, String> {
 #[rustler::nif]
 fn in_transaction(env: Env, db: ResourceArc<DbResource>) -> bool {
     let st = db.lock();
-    st.owner.as_ref().map(|(p, _)| *p == env.pid()).unwrap_or(false)
+    st.owner
+        .as_ref()
+        .map(|(p, _)| *p == env.pid())
+        .unwrap_or(false)
 }
 
 /// Act on a replicator's request now, for a handle that may sit idle
@@ -1116,9 +1148,12 @@ fn legacy_kind(path: String) -> Option<String> {
 fn migrate(path: String) -> Result<(u64, u64), String> {
     let db = Path::new(&path);
     if glider::legacy::detect(db).is_none() {
-        return Err(format!("{path} is not a legacy glider file; nothing to migrate"));
+        return Err(format!(
+            "{path} is not a legacy glider file; nothing to migrate"
+        ));
     }
-    let old = glider::legacy::graph::Graph::open(db, GliderSync::Normal).map_err(|e| e.to_string())?;
+    let old =
+        glider::legacy::graph::Graph::open(db, GliderSync::Normal).map_err(|e| e.to_string())?;
     let tmp = format!("{path}.migrating");
     for suffix in ["", "-wal", "-data", ".lock"] {
         let _ = std::fs::remove_file(format!("{tmp}{suffix}"));
@@ -1153,7 +1188,9 @@ fn migrate(path: String) -> Result<(u64, u64), String> {
 // arrive as a map with string keys (never atoms; see 3. above).
 
 fn opt_str(opts: &HashMap<String, Term>, k: &str) -> Option<String> {
-    opts.get(k).and_then(|t| t.decode::<String>().ok()).filter(|s| !s.is_empty())
+    opts.get(k)
+        .and_then(|t| t.decode::<String>().ok())
+        .filter(|s| !s.is_empty())
 }
 
 fn opt_u64(opts: &HashMap<String, Term>, k: &str) -> Option<u64> {
@@ -1234,7 +1271,9 @@ fn replication_sync<'a>(
     enforce_retention: bool,
 ) -> Result<Term<'a>, String> {
     let r = paged_replicator(&db, &url, &opts)?;
-    let s = r.sync(force_snapshot, enforce_retention).map_err(|e| e.to_string())?;
+    let s = r
+        .sync(force_snapshot, enforce_retention)
+        .map_err(|e| e.to_string())?;
     let lag = r.lag(&s.generation).ok();
     Ok(map_term(
         env,
