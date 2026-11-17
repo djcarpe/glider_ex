@@ -7,6 +7,7 @@ defmodule Glider.BudgetTest do
 
   defp seeded(n) do
     {:ok, db} = Glider.open()
+
     for chunk <- Enum.chunk_every(1..n, 1_000) do
       statements = for i <- chunk, do: {"CREATE (:N {i: $i})", %{i: i}}
       {:ok, _} = Glider.write_batch(db, statements)
@@ -48,5 +49,26 @@ defmodule Glider.BudgetTest do
     assert_raise ArgumentError, fn ->
       Glider.query(db, "MATCH (n) RETURN n", %{}, max_steps: -1)
     end
+  end
+
+  test "candidates rejected before any match count against both budgets" do
+    {:ok, db} = Glider.open()
+
+    for chunk <- Enum.chunk_every(1..30_000, 1_000) do
+      {:ok, _} =
+        Glider.write_batch(
+          db,
+          for(i <- chunk, do: {"CREATE (:Function {name: $n})", %{n: "fn_#{i}"}})
+        )
+    end
+
+    q = "MATCH (a:Function), (b:Function {name:'zzz'}) RETURN count(*)"
+    {us, result} = :timer.tc(fn -> Glider.cursor(db, q, %{}, max_millis: 1_000) end)
+    assert {:error, "statement stopped: it ran past its time budget of 1000 ms"} = result
+    assert us < 1_300_000
+
+    {us, result} = :timer.tc(fn -> Glider.query(db, q, %{}, max_steps: 100_000) end)
+    assert {:error, "statement stopped: " <> _} = result
+    assert us < 1_000_000
   end
 end
