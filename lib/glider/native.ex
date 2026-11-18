@@ -13,8 +13,11 @@ defmodule Glider.Native do
   def legacy_kind(_path), do: err()
   def migrate(_path), do: err()
   def query(_db, _q, _params), do: err()
-  def query_bounded(_db, _q, _params, _max_rows, _max_bytes, _projection), do: err()
-  def cursor_open(_db, _q, _params, _max_rows, _max_bytes), do: err()
+
+  def query_bounded(_db, _q, _params, _max_rows, _max_bytes, _projection, _millis, _steps),
+    do: err()
+
+  def cursor_open(_db, _q, _params, _max_rows, _max_bytes, _millis, _steps), do: err()
   def cursor_next(_cursor), do: err()
   def cursor_close(_cursor), do: err()
   def memory_budget, do: err()
