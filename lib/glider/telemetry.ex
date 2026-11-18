@@ -78,6 +78,11 @@ defmodule Glider.Telemetry do
           page_hits: non_neg_integer(),
           page_misses: non_neg_integer(),
           evictions: non_neg_integer(),
+          hot_pages: non_neg_integer(),
+          hot_hits: non_neg_integer(),
+          promotions: non_neg_integer(),
+          demotions: non_neg_integer(),
+          prewarmed: non_neg_integer(),
           commits: non_neg_integer(),
           rollbacks: non_neg_integer(),
           checkpoints: non_neg_integer()

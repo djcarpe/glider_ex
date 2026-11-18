@@ -149,6 +149,12 @@ defmodule Glider do
     * `:sync` - `:always`, `:normal` (default) or `:off`.
     * `:cache_size` - per-database cache ceiling, within the shared process
       cache budget. Defaults to the process cache budget.
+    * `:hot_size` - how much of that cache to keep for the pages used most
+      often, which scans and other databases then leave alone; at most half
+      the cache. The hot page list is kept beside the file (`<path>-hot`)
+      and loaded at the next open, before `open/2` returns, so a database
+      opened again, or restored from a replica, starts warm. Default `0`:
+      no hot set, and nothing written or read. See glider's `docs/HOT.md`.
     * `:work_mem` - memory algorithms may use before spilling to disk
       (default at most 32 MiB, admitted from the shared workspace).
     * `:checkpoint` - fold the write-ahead log into the pages after this much
@@ -181,7 +187,8 @@ defmodule Glider do
       sync,
       bytes(Keyword.get(opts, :cache_size, 0)),
       bytes(Keyword.get(opts, :work_mem, 0)),
-      checkpoint
+      checkpoint,
+      bytes(Keyword.get(opts, :hot_size, 0))
     )
   end
 
@@ -582,7 +589,13 @@ defmodule Glider do
       else: {:error, "not an extension name: #{inspect(name)}"}
   end
 
-  @doc "Node, edge, label and index counts, as a map."
+  @doc """
+  Node, edge, label and index counts, as a map. A database opened with
+  `:hot_size` adds the hot set's counters: `"hot_capacity"`, `"hot_pages"`,
+  `"hot_hits"`, `"promotions"`, `"demotions"` and `"prewarmed"` (pages
+  loaded at open from the list a previous open left). The page cache's
+  traffic is in `Glider.Telemetry.metrics/1`.
+  """
   @spec stats(db()) :: {:ok, map()} | {:error, String.t()}
   def stats(db) do
     with {:ok, r} <- query(db, "STATS") do

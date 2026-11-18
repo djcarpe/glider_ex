@@ -198,6 +198,7 @@ a large graph will not stall the VM.
 {:ok, db} = Glider.open("social.gldb", sync: :always)    # fsync every commit
 {:ok, db} = Glider.open("bulk.gldb", sync: :off, checkpoint: :off)
 {:ok, db} = Glider.open("big.gldb", cache_size: "4G", work_mem: "1G")
+{:ok, db} = Glider.open("api.gldb", cache_size: "256M", hot_size: "32M")
 ```
 
 The file is a paged database with a write-ahead log beside it. It can grow far
@@ -207,6 +208,14 @@ bytes of log (default 256M) or on `checkpoint/1`. A torn log tail is discarded
 on open, so you never see a partial transaction. Only one writer may hold a
 file; a second `open/2` returns `{:error, reason}` until the first calls
 `close/1` or is garbage collected.
+
+With `hot_size`, part of the cache is kept for the pages used most often, and
+their list is written beside the file at each checkpoint and on close and
+loaded before the next `open/2` returns: a database opened again, or restored
+from a replica (whose base carries the list), answers its first lookups of
+those pages from memory. `Glider.stats/1` reports `"prewarmed"` and the
+other hot-set counters, `Glider.Telemetry.metrics/1` the same beside the
+cache's page reads (glider's `docs/HOT.md`).
 
 Sizes are bytes, or strings like `"256M"` and `"4G"`.
 
