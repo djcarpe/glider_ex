@@ -251,6 +251,36 @@ pending for the next pass. `generations/2`, `listing/3`, `lag/3` and
 `[:glider, :replication, :sync]` telemetry with the bytes, bases, segments,
 lag and duration.
 
+A graph in memory replicates too, once it keeps a log. It ships the same
+objects a file does, so a replica restores to either place whichever wrote
+it, on the same lineage:
+
+```elixir
+{:ok, db} = Glider.open(max_memory: "4G", log: true)
+{:ok, %{bases_uploaded: 1}} = Glider.Replication.sync(db, "s3://graphs/app", s3)   # the handle, not a path
+
+{Glider.Replicator, db: db, url: "s3://graphs/app", interval: 1_000, endpoint: "http://minio.internal:9000"}
+
+{:ok, %{db: db}} = Glider.Replication.restore("s3://graphs/app", :memory, [max_memory: "4G"] ++ s3)
+{:ok, _report} = Glider.Replication.restore("s3://graphs/app", "on-disk.gldb", s3)
+```
+
+A pass holds the handle only to take what it ships — the committed pages
+by reference, in about the time it takes to copy that many pointers, or
+the log since the last pass — and to record that it was shipped. The upload
+runs on a dirty I/O scheduler with the handle free, so other processes'
+queries carry on while a base is in the air. A graph restored into memory
+keeps a log that starts where the replica ended: pointed back at that
+replica, it ships only what it writes from then on, with no new base. A
+file restored from a replica does the same, if it is replicated again
+within ten minutes of the restore (after that it takes a base).
+
+What is in memory and not yet shipped is lost with the VM: that window is
+the interval between passes. The log is held in memory until it is shipped,
+up to `:log_cap` (64M by default); past it the next pass takes a new base.
+A memory graph opened without `log: true` keeps no log and cannot be
+replicated, and pays nothing for it.
+
 ## Writing queries in Elixir source
 
 Use a plain string, or a heredoc sigil. **Do not use the bracket sigils**:

@@ -8,7 +8,7 @@ defmodule Glider.Native do
 
   use Rustler, otp_app: :glider_ex, crate: "glider_nif"
 
-  def open_memory(_max_bytes), do: err()
+  def open_memory(_max_bytes, _log, _log_cap), do: err()
   def open_file(_path, _sync, _cache_size, _work_mem, _checkpoint_bytes), do: err()
   def legacy_kind(_path), do: err()
   def migrate(_path), do: err()
@@ -41,6 +41,10 @@ defmodule Glider.Native do
   def replication_restore(_url, _out, _generation, _as_of, _opts), do: err()
   def replication_generations(_url, _opts), do: err()
   def replication_listing(_url, _generation, _opts), do: err()
+  def memory_replication_sync(_db, _url, _opts, _force_snapshot, _enforce_retention), do: err()
+  def memory_replication_lag(_db, _url, _opts), do: err()
+  def memory_replication_enforce_retention(_db, _url, _opts), do: err()
+  def memory_replication_restore(_url, _generation, _as_of, _max_bytes, _log_cap, _opts), do: err()
   def close(_db), do: err()
   def version, do: err()
   def telemetry_snapshot, do: err()

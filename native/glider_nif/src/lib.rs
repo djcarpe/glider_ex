@@ -27,6 +27,13 @@
 //! NIF returns `Result<_, String>`, which rustler encodes as `{:ok, _}` or
 //! `{:error, reason}`.
 //!
+//! 5. **A replication pass holds the handle only to capture and to
+//!    acknowledge.** A memory database's pass (glider's `stream::memory`)
+//!    takes the handle's mutex to snapshot the page table or copy the log,
+//!    lets go of it for the upload, and takes it again to record what was
+//!    shipped, all inside one dirty I/O call: other processes' queries on
+//!    the handle run while a base is in the air.
+//!
 //! Telemetry: `query` hands back the engine's report on the statement (rows,
 //! pages read and hit, duration) alongside the result, and on failure, so the
 //! Elixir side can put it on `:telemetry` events and OpenTelemetry spans. The
@@ -36,7 +43,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rustler::{
@@ -47,7 +54,9 @@ use glider::api::{self, Entity};
 use glider::graph::{Dir, Graph, OpenOptions};
 use glider::query::{self, QueryResult};
 use glider::store::Sync as GliderSync;
+use glider::storage::log::DEFAULT_LOG_CAP;
 use glider::stream::config::{self as stream_config, ReplicaConfig};
+use glider::stream::memory::{self as stream_memory, MemoryReplicator};
 use glider::stream::paged::{self, PagedReplicator};
 use glider::telemetry::{self, DbMetrics, OpReport};
 use glider::value::Value;
@@ -71,6 +80,10 @@ pub struct DbResource {
     state: Mutex<State>,
     /// Signalled when a transaction ends.
     free: Condvar,
+    /// A memory database's replicators, one per replica (its url and
+    /// endpoint), kept with the handle: what each has learned of its backend
+    /// outlives a pass, so only the first pass to a replica looks first.
+    replicators: Mutex<HashMap<String, Arc<Mutex<MemoryReplicator>>>>,
 }
 
 struct State {
@@ -164,6 +177,7 @@ fn new_handle(graph: Graph) -> ResourceArc<DbResource> {
             aborted: false,
         }),
         free: Condvar::new(),
+        replicators: Mutex::new(HashMap::new()),
     })
 }
 
@@ -784,18 +798,36 @@ fn write_batch(env: Env, db: ResourceArc<DbResource>, statements: Term) -> Resul
 
 // --------------------------------------------------------------------- NIFs
 
-/// An in-memory graph; `max_bytes` 0 means the machine's physical memory.
-/// Past the limit, writes fail with "graph is full" and roll back.
-#[rustler::nif]
-fn open_memory(max_bytes: u64) -> ResourceArc<DbResource> {
+/// `max_bytes` for a memory graph: 0 means as much as the process budget
+/// gives the BEAM's graphs, and never more.
+fn memory_limit(max_bytes: u64) -> u64 {
     let budget = glider::budget::ensure();
-    let mut g = Graph::memory_with_limit(if max_bytes == 0 {
+    if max_bytes == 0 {
         budget.config.beam
     } else {
         max_bytes.min(budget.config.beam)
-    });
+    }
+}
+
+fn memory_handle(mut g: Graph) -> ResourceArc<DbResource> {
+    let budget = glider::budget::ensure();
     g.set_work_mem((32 << 20).min(budget.config.work / 2));
     new_handle(g)
+}
+
+/// An in-memory graph; `max_bytes` 0 means the machine's physical memory.
+/// Past the limit, writes fail with "graph is full" and roll back. With
+/// `log`, it keeps its log in memory, at most `log_cap` bytes (0: the
+/// engine's default) of it committed and not yet shipped, so it can be
+/// replicated.
+#[rustler::nif]
+fn open_memory(max_bytes: u64, log: bool, log_cap: u64) -> Result<ResourceArc<DbResource>, String> {
+    let mut g = Graph::memory_with_limit(memory_limit(max_bytes));
+    if log {
+        g.enable_log(if log_cap == 0 { DEFAULT_LOG_CAP } else { log_cap })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(memory_handle(g))
 }
 
 /// Opening reads a superblock and replays whatever log a crash left, which
@@ -1291,17 +1323,7 @@ fn replication_sync<'a>(
         .sync(force_snapshot, enforce_retention)
         .map_err(|e| e.to_string())?;
     let lag = r.lag(&s.generation).ok();
-    Ok(map_term(
-        env,
-        vec![
-            ("generation", s.generation.encode(env)),
-            ("bases_uploaded", s.bases_uploaded.encode(env)),
-            ("segments_uploaded", s.segments_uploaded.encode(env)),
-            ("bytes", s.bytes.encode(env)),
-            ("deleted", s.deleted.encode(env)),
-            ("lag_bytes", opt_term(env, lag)),
-        ],
-    ))
+    Ok(sync_report(env, &s, lag))
 }
 
 /// Delete bases, log and idle generations past the retention period.
@@ -1347,16 +1369,7 @@ fn replication_restore<'a>(
         Path::new(&out),
     )
     .map_err(|e| e.to_string())?;
-    Ok(map_term(
-        env,
-        vec![
-            ("generation", r.generation.encode(env)),
-            ("base_lsn", r.base.lsn.encode(env)),
-            ("base_ts", r.base.ts.encode(env)),
-            ("segments", r.segments.encode(env)),
-            ("through", r.through.encode(env)),
-        ],
-    ))
+    Ok(restore_report(env, &r))
 }
 
 /// Generations of paged replicas in the backend, least recently active first.
@@ -1419,6 +1432,167 @@ fn replication_listing<'a>(
             ("last_ts", l.last_ts().encode(env)),
         ],
     ))
+}
+
+// ------------------------------------------------------ memory replication
+//
+// The same replicas, shipped from a memory database with a log
+// (glider's src/stream/memory.rs) and restored into one. Same options, same
+// report.
+
+fn sync_report<'a>(env: Env<'a>, s: &paged::SyncReport, lag: Option<u64>) -> Term<'a> {
+    map_term(
+        env,
+        vec![
+            ("generation", s.generation.encode(env)),
+            ("bases_uploaded", s.bases_uploaded.encode(env)),
+            ("segments_uploaded", s.segments_uploaded.encode(env)),
+            ("bytes", s.bytes.encode(env)),
+            ("deleted", s.deleted.encode(env)),
+            ("lag_bytes", opt_term(env, lag)),
+        ],
+    )
+}
+
+fn restore_report<'a>(env: Env<'a>, r: &glider::replica::RestoreReport) -> Term<'a> {
+    map_term(
+        env,
+        vec![
+            ("generation", r.generation.encode(env)),
+            ("base_lsn", r.base.lsn.encode(env)),
+            ("base_ts", r.base.ts.encode(env)),
+            ("segments", r.segments.encode(env)),
+            ("through", r.through.encode(env)),
+        ],
+    )
+}
+
+/// The handle's replicator for `url`, configured by `opts` as they are now.
+fn memory_replicator(
+    db: &DbResource,
+    url: &str,
+    opts: &HashMap<String, Term>,
+) -> Result<Arc<Mutex<MemoryReplicator>>, String> {
+    let rc = replica_config(url, opts);
+    let backend = stream_config::open_backend(&rc).map_err(|e| e.to_string())?;
+    let key = format!("{url}\n{}", rc.endpoint.as_deref().unwrap_or(""));
+    let mut reps = db.replicators.lock().unwrap_or_else(|e| e.into_inner());
+    let rep = reps
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(MemoryReplicator::new(backend.clone(), rc.clone()))))
+        .clone();
+    drop(reps);
+    {
+        let mut r = rep.lock().unwrap_or_else(|e| e.into_inner());
+        r.backend = backend;
+        r.cfg = rc;
+    }
+    Ok(rep)
+}
+
+/// The generation (as keys spell it) and last commit of a memory graph with
+/// a log.
+fn memory_position(db: &DbResource) -> Result<(String, u64), String> {
+    let st = db.lock();
+    let g = st.graph.as_ref().ok_or("this graph is closed")?;
+    let (_, committed) = g.log_span().ok_or_else(|| {
+        if g.is_persistent() {
+            "a file database replicates from its files: give its path".to_string()
+        } else {
+            "this graph keeps no log: open it with log: true to replicate it".to_string()
+        }
+    })?;
+    Ok((glider::replica::generation_name(&g.generation()), committed))
+}
+
+/// One pass over a memory database: capture under the handle's mutex,
+/// upload without it, acknowledge under it again — all on this dirty I/O
+/// scheduler. The mutex is taken directly, not through a transaction: a
+/// capture leaves an open transaction out, so a pass need not wait for one.
+#[rustler::nif(schedule = "DirtyIo")]
+fn memory_replication_sync<'a>(
+    env: Env<'a>,
+    db: ResourceArc<DbResource>,
+    url: String,
+    opts: HashMap<String, Term<'a>>,
+    force_snapshot: bool,
+    enforce_retention: bool,
+) -> Result<Term<'a>, String> {
+    memory_position(&db)?;
+    let rep = memory_replicator(&db, &url, &opts)?;
+    let rep = rep.lock().unwrap_or_else(|e| e.into_inner());
+    let s = rep
+        .sync_with(
+            &mut |f| {
+                let mut st = db.lock();
+                match st.graph.as_mut() {
+                    Some(g) => {
+                        f(g);
+                        Ok(())
+                    }
+                    None => Err(std::io::Error::other("this graph is closed")),
+                }
+            },
+            force_snapshot,
+            enforce_retention,
+        )
+        .map_err(|e| e.to_string())?;
+    let lag = db.lock().graph.as_ref().and_then(|g| rep.lag(g));
+    Ok(sync_report(env, &s, lag))
+}
+
+/// Committed log of a memory database not yet in the backend, in bytes.
+#[rustler::nif(schedule = "DirtyIo")]
+fn memory_replication_lag(
+    db: ResourceArc<DbResource>,
+    url: String,
+    opts: HashMap<String, Term>,
+) -> Result<u64, String> {
+    let (gen, committed) = memory_position(&db)?;
+    let backend = backend_for(&url, &opts)?;
+    let l = paged::listing(backend.as_ref(), &gen).map_err(|e| e.to_string())?;
+    Ok(stream_memory::lag(&l, committed))
+}
+
+/// Retention for a memory database's replica, never touching the
+/// generation the database is on.
+#[rustler::nif(schedule = "DirtyIo")]
+fn memory_replication_enforce_retention(
+    db: ResourceArc<DbResource>,
+    url: String,
+    opts: HashMap<String, Term>,
+) -> Result<usize, String> {
+    let (gen, _) = memory_position(&db)?;
+    let rc = replica_config(&url, &opts);
+    let backend = stream_config::open_backend(&rc).map_err(|e| e.to_string())?;
+    paged::expire(backend.as_ref(), &gen, rc.retention).map_err(|e| e.to_string())
+}
+
+/// A memory graph from the newest base at or before `as_of` and the log
+/// after it: an open handle, on the replica's lineage, with a log (at most
+/// `log_cap` bytes unshipped; 0 for the default) carrying on where the
+/// replay ended. A replica that does not fit `max_bytes` is an error and
+/// leaves nothing allocated.
+#[rustler::nif(schedule = "DirtyIo")]
+fn memory_replication_restore<'a>(
+    env: Env<'a>,
+    url: String,
+    generation: Option<String>,
+    as_of: Option<u64>,
+    max_bytes: u64,
+    log_cap: u64,
+    opts: HashMap<String, Term<'a>>,
+) -> Result<(ResourceArc<DbResource>, Term<'a>), String> {
+    let backend = backend_for(&url, &opts)?;
+    let (g, r) = stream_memory::restore(
+        backend.as_ref(),
+        generation.as_deref(),
+        as_of,
+        memory_limit(max_bytes),
+        if log_cap == 0 { DEFAULT_LOG_CAP } else { log_cap },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((memory_handle(g), restore_report(env, &r)))
 }
 
 fn load(_env: Env, _info: Term) -> bool {

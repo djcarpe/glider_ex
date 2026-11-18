@@ -131,12 +131,23 @@ defmodule Glider do
 
     * `:max_memory` - the most memory the graph may use (a `t:size/0`).
       Past it, writes fail cleanly and roll back. Defaults to physical RAM.
+    * `:log` - `true` to keep the graph's log in memory, so that it can be
+      replicated (`Glider.Replication.sync/3` given the handle). A graph
+      without one pays nothing for it, and cannot be replicated.
+    * `:log_cap` - with `:log`, the most committed log kept before it has
+      been shipped (a `t:size/0`, default 64M). Past it the log is dropped
+      and the next pass takes a new base: no data is lost, only that
+      stretch's point-in-time restores.
   """
   @spec open(keyword()) :: {:ok, db()} | {:error, String.t()}
   def open(opts \\ [])
 
   def open(opts) when is_list(opts) do
-    {:ok, Native.open_memory(bytes(Keyword.get(opts, :max_memory, 0)))}
+    Native.open_memory(
+      bytes(Keyword.get(opts, :max_memory, 0)),
+      Keyword.get(opts, :log, false) == true,
+      bytes(Keyword.get(opts, :log_cap, 0))
+    )
   end
 
   def open(path) when is_binary(path), do: open(path, [])
@@ -681,6 +692,10 @@ defmodule Glider do
   defp describe(q), do: q
 
   @units %{"" => 1, "K" => 1 <<< 10, "M" => 1 <<< 20, "G" => 1 <<< 30, "T" => 1 <<< 40}
+
+  @doc false
+  # Sizes for Glider.Replication's options.
+  def to_bytes(size), do: bytes(size)
 
   defp bytes(n) when is_integer(n) and n >= 0, do: n
 

@@ -1,7 +1,8 @@
 defmodule Glider.Replication do
   @moduledoc """
-  Continuous replication of a paged glider database to S3, a directory or an
-  `exec:` command, and restore from there: glider-stream's paged replication
+  Continuous replication of a paged glider database — a file, or a graph in
+  memory — to S3, a directory or an `exec:` command, and restore from there
+  to either: glider-stream's paged replication
   (glider's `docs/STREAM.md`, "Paged databases"), called in-process.
 
   A replica is base snapshots plus the write-ahead log shipped after them:
@@ -37,6 +38,23 @@ defmodule Glider.Replication do
     * `:retention`, `:retention_enabled` — seconds to keep old bases, log and
       idle generations (default a day, enabled)
 
+  ## A database in memory
+
+  A memory graph opened with a log (`Glider.open(log: true)`) replicates as
+  the same objects: give `sync/3`, `lag/3` and `enforce_retention/3` its
+  handle where a file is given its path. There is no spool; a pass takes the
+  handle to snapshot the committed pages (a copy of the page table, not of
+  the pages) or the log since the last pass, uploads it with the handle free
+  for other processes' queries, and takes the handle again to record what
+  was shipped. `restore(url, :memory, opts)` restores into memory and hands
+  back an open handle. A replica does not record where its pages were, so a
+  graph replicated from memory restores to a file and the other way round,
+  and a pass from the restored side to the replica it came from ships only
+  what was written since: same generation, no new base.
+
+  Extra options for memory: `:max_memory` and `:log_cap` for a restore, as
+  `Glider.open/1` takes them.
+
   ## The writer
 
   A base is copied from a checkpoint the writer holds in place for the copy.
@@ -63,12 +81,25 @@ defmodule Glider.Replication do
   @doc """
   One pass: ship what is pending and upload it. Returns what was uploaded.
 
-  Extra options: `:db` (an open handle to poll while a base is copied),
-  `:force_snapshot` (take a new base now), `:enforce_retention` (run
-  retention afterwards).
+  `source` is a database file's path, or the handle of a memory graph opened
+  with `log: true`.
+
+  Extra options: `:db` (for a file, an open handle to poll while a base is
+  copied), `:force_snapshot` (take a new base now), `:enforce_retention`
+  (run retention afterwards).
   """
-  @spec sync(Path.t(), url(), keyword()) :: {:ok, report()} | {:error, String.t()}
-  def sync(path, url, opts \\ []) do
+  @spec sync(Path.t() | Glider.db(), url(), keyword()) :: {:ok, report()} | {:error, String.t()}
+  def sync(source, url, opts \\ [])
+
+  def sync(db, url, opts) when is_reference(db) do
+    force = Keyword.get(opts, :force_snapshot, false)
+    retention = Keyword.get(opts, :enforce_retention, false)
+    started = System.monotonic_time()
+    result = Native.memory_replication_sync(db, url, native_opts(opts), force, retention)
+    emit(result, started, %{path: nil, db: db, url: url})
+  end
+
+  def sync(path, url, opts) do
     native_opts = native_opts(opts)
     force = Keyword.get(opts, :force_snapshot, false)
     retention = Keyword.get(opts, :enforce_retention, false)
@@ -82,23 +113,44 @@ defmodule Glider.Replication do
         db -> polling(db, call)
       end
 
-    :telemetry.execute(
-      [:glider, :replication, :sync],
-      measurements(result, started),
-      %{path: to_string(path), url: url, result: elem(result, 0)}
-    )
-
-    result
+    emit(result, started, %{path: to_string(path), url: url})
   end
 
   @doc """
-  Rebuild a database at `out` from the replica at `url`. Options: `:as_of`
-  (unix seconds: the newest base taken by then and the log shipped by then),
-  `:generation` (a specific lineage), and the backend options. Open the
-  result with `Glider.open/2` to finish; opening replays the log.
+  Rebuild a database from the replica at `url`: the newest base at or before
+  `:as_of` and the log shipped after it. Whichever kind of database wrote
+  the replica, it restores to either place.
+
+  To a path, it lays the database out at `out`; open the result with
+  `Glider.open/2` to finish (opening replays the log). To `:memory`, it
+  replays the log into a memory graph and the report carries its open
+  handle as `:db`; the graph keeps a log, so it replicates on from where
+  the replica ended.
+
+  Options: `:as_of` (unix seconds: the newest base taken by then and the log
+  shipped by then), `:generation` (a specific lineage), the backend options,
+  and for `:memory` the `:max_memory` the graph may use (a replica that does
+  not fit is an error, and nothing of it stays allocated) and its
+  `:log_cap`.
   """
-  @spec restore(url(), Path.t(), keyword()) :: {:ok, map()} | {:error, String.t()}
-  def restore(url, out, opts \\ []) do
+  @spec restore(url(), Path.t() | :memory, keyword()) :: {:ok, map()} | {:error, String.t()}
+  def restore(url, out, opts \\ [])
+
+  def restore(url, :memory, opts) do
+    case Native.memory_replication_restore(
+           url,
+           Keyword.get(opts, :generation),
+           Keyword.get(opts, :as_of),
+           Glider.to_bytes(Keyword.get(opts, :max_memory, 0)),
+           Glider.to_bytes(Keyword.get(opts, :log_cap, 0)),
+           native_opts(opts)
+         ) do
+      {:ok, {db, report}} -> {:ok, Map.put(report, :db, db)}
+      {:error, _} = error -> error
+    end
+  end
+
+  def restore(url, out, opts) do
     Native.replication_restore(
       url,
       to_string(out),
@@ -121,18 +173,38 @@ defmodule Glider.Replication do
   def listing(url, generation, opts \\ []),
     do: Native.replication_listing(url, generation, native_opts(opts))
 
-  @doc "Committed log at `path` not yet at `url`, in bytes."
-  @spec lag(Path.t(), url(), keyword()) :: {:ok, non_neg_integer()} | {:error, String.t()}
-  def lag(path, url, opts \\ []), do: Native.replication_lag(to_string(path), url, native_opts(opts))
+  @doc "Committed log of `source` (a path, or a memory graph's handle) not yet at `url`, in bytes."
+  @spec lag(Path.t() | Glider.db(), url(), keyword()) :: {:ok, non_neg_integer()} | {:error, String.t()}
+  def lag(source, url, opts \\ [])
+  def lag(db, url, opts) when is_reference(db), do: Native.memory_replication_lag(db, url, native_opts(opts))
+  def lag(path, url, opts), do: Native.replication_lag(to_string(path), url, native_opts(opts))
 
   @doc """
   Delete bases older than `:retention` (never the newest), the log below the
   oldest base kept, and generations idle longer than that (never the
-  current one). Returns how many objects went.
+  current one: that of `source`, a path or a memory graph's handle).
+  Returns how many objects went.
   """
-  @spec enforce_retention(Path.t(), url(), keyword()) :: {:ok, non_neg_integer()} | {:error, String.t()}
-  def enforce_retention(path, url, opts \\ []),
+  @spec enforce_retention(Path.t() | Glider.db(), url(), keyword()) ::
+          {:ok, non_neg_integer()} | {:error, String.t()}
+  def enforce_retention(source, url, opts \\ [])
+
+  def enforce_retention(db, url, opts) when is_reference(db),
+    do: Native.memory_replication_enforce_retention(db, url, native_opts(opts))
+
+  def enforce_retention(path, url, opts),
     do: Native.replication_enforce_retention(to_string(path), url, native_opts(opts))
+
+  # Every pass, of either kind, is one telemetry event.
+  defp emit(result, started, meta) do
+    :telemetry.execute(
+      [:glider, :replication, :sync],
+      measurements(result, started),
+      Map.put(meta, :result, elem(result, 0))
+    )
+
+    result
+  end
 
   # Run the pass in a task and poll the writer until it finishes, so a base
   # copy is never left waiting for a commit that may not come.

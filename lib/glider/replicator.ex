@@ -15,7 +15,15 @@ defmodule Glider.Replicator do
 
   `:db` is the open handle, if this VM holds the database open: the pass
   polls it while a base is copied. Every other option goes to
-  `Glider.Replication.sync/3`. A failed pass is logged and counted, and the
+  `Glider.Replication.sync/3`.
+
+  A memory graph opened with `log: true` has no path: give its handle as
+  `:db` and leave `:path` out.
+
+      {Glider.Replicator, db: db, url: "s3://graphs/app", endpoint: "http://minio.internal:9000"}
+
+  Each pass then holds the handle only to capture what it ships and to
+  record that it was shipped, never while it uploads. A failed pass is logged and counted, and the
   next one picks up whatever it left pending — nothing is dropped.
 
   Passes run in the replicator's own process, one at a time; `status/1` and
@@ -28,7 +36,7 @@ defmodule Glider.Replicator do
   alias Glider.Replication
 
   @type status :: %{
-          path: String.t(),
+          path: String.t() | nil,
           url: String.t(),
           passes: non_neg_integer(),
           errors: non_neg_integer(),
@@ -44,7 +52,7 @@ defmodule Glider.Replicator do
 
   def child_spec(opts) do
     %{
-      id: Keyword.get(opts, :name, {__MODULE__, Keyword.fetch!(opts, :path), Keyword.fetch!(opts, :url)}),
+      id: Keyword.get(opts, :name, {__MODULE__, source(opts), Keyword.fetch!(opts, :url)}),
       start: {__MODULE__, :start_link, [opts]}
     }
   end
@@ -59,7 +67,8 @@ defmodule Glider.Replicator do
 
   @impl true
   def init(opts) do
-    path = opts |> Keyword.fetch!(:path) |> to_string()
+    source = source(opts)
+    path = if is_binary(source), do: source
     url = Keyword.fetch!(opts, :url)
     interval = Keyword.get(opts, :interval, 1_000)
     retention_every = Keyword.get(opts, :retention_every, 3_600_000)
@@ -67,6 +76,7 @@ defmodule Glider.Replicator do
 
     state = %{
       path: path,
+      source: source,
       url: url,
       interval: interval,
       retention_every: retention_every,
@@ -104,7 +114,7 @@ defmodule Glider.Replicator do
   end
 
   defp pass(state, extra) do
-    result = Replication.sync(state.path, state.url, Keyword.merge(state.sync_opts, extra))
+    result = Replication.sync(state.source, state.url, Keyword.merge(state.sync_opts, extra))
     state = %{state | passes: state.passes + 1, last_at: DateTime.utc_now()}
 
     case result do
@@ -112,8 +122,17 @@ defmodule Glider.Replicator do
         {result, %{state | last: report, last_error: nil}}
 
       {:error, reason} ->
-        Logger.warning("glider replication of #{state.path} to #{state.url}: #{reason} (retrying)")
+        Logger.warning("glider replication of #{state.path || "a memory graph"} to #{state.url}: #{reason} (retrying)")
         {result, %{state | errors: state.errors + 1, last_error: reason}}
+    end
+  end
+
+  # A file by its path, or a memory graph by its handle.
+  defp source(opts) do
+    case {Keyword.get(opts, :path), Keyword.get(opts, :db)} do
+      {nil, nil} -> raise ArgumentError, "Glider.Replicator needs :path, or :db for a memory graph"
+      {nil, db} -> db
+      {path, _} -> to_string(path)
     end
   end
 end
