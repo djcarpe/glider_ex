@@ -71,6 +71,13 @@ are substituted as literals, so a value can never change the query:
 Glider.all(db, "MATCH (p:Person) WHERE p.age > $min RETURN p.name", min: 30)
 ```
 
+Nesting is limited to 64 levels, as glider limits it (its README, "Limits"):
+a list parameter nested deeper is refused before it reaches the engine, and
+a statement nested deeper (parentheses, nested lists, `NOT` or `-` chains,
+subscripts, nested calls) is an `{:error, _}`, never a crash of the VM.
+Long `AND` chains, sums, lists and many patterns are not deep and have no
+such limit.
+
 ## Composable queries
 
 `Glider.Query` builds queries the way Ecto does: small functions that take a
@@ -157,6 +164,11 @@ transaction is rolled back for it. An exception rolls back and re-raises; a
 statement that fails inside the transaction aborts it, and it returns
 `{:error, reason}` without committing. A nested `transaction/2` joins the
 outer one.
+
+`BEGIN`, `COMMIT` and `ROLLBACK` sent as statement text are refused, from
+every function that takes a statement: as text they would open or close the
+handle's transaction for every process at once, with no owner to roll it
+back.
 
 ## Types
 
