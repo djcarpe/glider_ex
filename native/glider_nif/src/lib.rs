@@ -169,9 +169,11 @@ fn new_handle(graph: Graph) -> ResourceArc<DbResource> {
 
 /// An Elixir term as a glider value: nil, booleans, integers, floats,
 /// binaries and lists of those. Anything else is refused rather than
-/// guessed at.
+/// guessed at. `depth` is the number of lists around `t`: a list nested
+/// deeper than glider lets any value be is refused here, with glider's own
+/// message, before anything recurses over it.
 fn term_value(t: Term, remaining: &mut u64, depth: usize) -> Result<Value, String> {
-    if depth > 64 || *remaining < 64 {
+    if *remaining < 64 {
         return Err("parameter work_mem exceeded".into());
     }
     *remaining -= 64;
@@ -204,6 +206,9 @@ fn term_value(t: Term, remaining: &mut u64, depth: usize) -> Result<Value, Strin
                 .map_err(|_| "binary parameter is not valid UTF-8".into())
         }
         TermType::List => {
+            if depth >= glider::value::MAX_DEPTH {
+                return Err(glider::value::too_deep("list"));
+            }
             let items: rustler::types::list::ListIterator = t.decode().map_err(|_| "bad list")?;
             let mut values = Vec::new();
             for item in items {
@@ -240,7 +245,18 @@ fn source_of<'a>(binary: Binary<'a>) -> Result<&'a str, String> {
     if binary.len() > 1 << 20 {
         return Err("query source exceeds work_mem".into());
     }
-    std::str::from_utf8(binary.as_slice()).map_err(|_| "query is not UTF-8".into())
+    let src = std::str::from_utf8(binary.as_slice()).map_err(|_| "query is not UTF-8")?;
+    // The transaction is the handle's and is owned by one process at a time
+    // (`begin`, `commit`, `rollback` below). As text, BEGIN would turn
+    // autocommit off for every process using the handle, with no owner to
+    // roll it back when its process dies.
+    if query::controls_transaction(src) {
+        return Err(
+            "BEGIN, COMMIT and ROLLBACK are not run as statements here: use Glider.transaction/2"
+                .into(),
+        );
+    }
+    Ok(src)
 }
 
 // -------------------------------------------------------------------- terms
@@ -596,6 +612,7 @@ fn query_bounded<'a>(
         let limits = query::QueryLimits {
             max_rows,
             max_bytes: max_bytes.min(g.query_memory() / 4),
+            ..Default::default()
         };
         let r = query::execute_capped(g, &q, &params, limits).map_err(|e| e.to_string())?;
         result_term(env, g, &r, projection, limits.max_bytes)
@@ -622,6 +639,7 @@ fn cursor_open(
             query::QueryLimits {
                 max_rows,
                 max_bytes: max_bytes.min(g.query_memory() / 4),
+                ..Default::default()
             },
         )
         .map_err(|e| e.to_string())
