@@ -414,6 +414,11 @@ fn db_metrics_term<'a>(env: Env<'a>, name: &str, m: &DbMetrics) -> Term<'a> {
             ("page_hits", m.page_hits.encode(env)),
             ("page_misses", m.page_misses.encode(env)),
             ("evictions", m.evictions.encode(env)),
+            ("hot_pages", m.hot_pages.encode(env)),
+            ("hot_hits", m.hot_hits.encode(env)),
+            ("promotions", m.promotions.encode(env)),
+            ("demotions", m.demotions.encode(env)),
+            ("prewarmed", m.prewarmed.encode(env)),
             ("commits", m.commits.encode(env)),
             ("rollbacks", m.rollbacks.encode(env)),
             ("checkpoints", m.checkpoints.encode(env)),
@@ -830,8 +835,9 @@ fn open_memory(max_bytes: u64, log: bool, log_cap: u64) -> Result<ResourceArc<Db
     Ok(memory_handle(g))
 }
 
-/// Opening reads a superblock and replays whatever log a crash left, which
-/// waits on disk: DirtyIo. Sizes of 0 mean the engine's defaults.
+/// Opening reads a superblock, replays whatever log a crash left and loads
+/// the hot list a previous open left, all of which waits on disk: DirtyIo.
+/// Sizes of 0 mean the engine's defaults; `hot_size` 0 is no hot set.
 #[rustler::nif(schedule = "DirtyIo")]
 fn open_file(
     path: String,
@@ -839,6 +845,7 @@ fn open_file(
     cache_size: u64,
     work_mem: u64,
     checkpoint_bytes: u64,
+    hot_size: u64,
 ) -> Result<ResourceArc<DbResource>, String> {
     let mode = if sync == atoms::always() {
         GliderSync::Always
@@ -866,6 +873,7 @@ fn open_file(
         } else {
             checkpoint_bytes
         },
+        hot_size,
         ..d
     };
     let graph = Graph::open_opts(Path::new(&path), opts).map_err(|e| e.to_string())?;

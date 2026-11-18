@@ -9,7 +9,7 @@ defmodule Glider.Native do
   use Rustler, otp_app: :glider_ex, crate: "glider_nif"
 
   def open_memory(_max_bytes, _log, _log_cap), do: err()
-  def open_file(_path, _sync, _cache_size, _work_mem, _checkpoint_bytes), do: err()
+  def open_file(_path, _sync, _cache_size, _work_mem, _checkpoint_bytes, _hot_size), do: err()
   def legacy_kind(_path), do: err()
   def migrate(_path), do: err()
   def query(_db, _q, _params), do: err()
