@@ -611,6 +611,7 @@ impl Resource for CursorResource {}
 #[rustler::nif(schedule = "DirtyIo")]
 fn memory_budget(env: Env) -> Term {
     let b = glider::budget::ensure();
+    let native = glider::budget::native();
     map_term(
         env,
         vec![
@@ -621,6 +622,13 @@ fn memory_budget(env: Env) -> Term {
             ("work_limit_bytes", b.work.limit().encode(env)),
             ("work_used_bytes", b.work.used().encode(env)),
             ("beam_bytes", b.config.beam.encode(env)),
+            ("native_held_bytes", native.map(|n| n.held).encode(env)),
+            ("native_used_bytes", native.map(|n| n.used).encode(env)),
+            ("native_free_bytes", native.map(|n| n.free).encode(env)),
+            (
+                "native_released_bytes",
+                glider::budget::released().encode(env),
+            ),
         ],
     )
 }
@@ -1181,6 +1189,9 @@ fn close(env: Env, db: ResourceArc<DbResource>) -> Atom {
     }
     st.graph = None;
     db.free.notify_all();
+    drop(st);
+    // Its page cache and buffers are free in the allocator: back to the OS.
+    glider::budget::after_operation(true);
     atoms::ok()
 }
 

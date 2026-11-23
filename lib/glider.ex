@@ -298,7 +298,18 @@ defmodule Glider do
     end
   end
 
-  @doc "Process-wide cgroup budget and live cache/workspace usage, all in bytes."
+  @doc """
+  Process-wide cgroup budget and live cache/workspace usage, all in bytes.
+
+  Also what the native allocator holds for the process (`nil` where it is not
+  glibc): `native_used_bytes` (allocated: the page cache and every native
+  buffer outside the pools), `native_free_bytes` (freed and kept for reuse;
+  Glider trims it back to the OS past an eighth of the workspace, and glibc
+  still counts the trimmed pages here), `native_held_bytes` (the address
+  space it has in all) and `native_released_bytes` (given back by Glider's
+  trims so far). A governor counting the process's memory counts
+  `native_used_bytes`, not the pools alone.
+  """
   def memory_budget, do: Native.memory_budget()
 
   @doc "Shrink or restore the shared cache within its boot budget; returns retained bytes."
