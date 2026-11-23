@@ -51,6 +51,12 @@ defmodule Glider.BoundedTest do
     budget = Glider.memory_budget()
     assert budget.limit_bytes > 0
     assert budget.cache_limit_bytes > 0
+    assert is_integer(budget.native_released_bytes)
+
+    if budget.native_held_bytes do
+      assert budget.native_used_bytes <= budget.native_held_bytes
+      assert is_integer(budget.native_free_bytes)
+    end
   end
 
   test "export_file and import_file round-trip, and export refuses to overwrite" do
