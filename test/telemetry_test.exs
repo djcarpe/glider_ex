@@ -111,19 +111,31 @@ defmodule Glider.TelemetryTest do
     assert_receive {:event, [:glider, :query, :stop], m,
                     %{db: ^db, procedure: "changes.since"} = meta}
 
-    assert meta.operation == "CALL" and meta.result == :ok and m.rows == 0
+    # the one row is the engine's end row
+    assert meta.operation == "CALL" and meta.result == :ok and m.rows == 1
     assert meta.query =~ "CALL changes.since(revision: $revision)"
 
+    # "cannot answer" is an answer: the statement succeeds
     {:error, %Glider.Changes.Unanswerable{}} = Glider.Changes.since(db, 0)
 
     assert_receive {:event, [:glider, :query, :stop], _,
-                    %{db: ^db, procedure: "changes.since", result: :error}}
+                    %{db: ^db, procedure: "changes.since", result: :ok}}
+
+    :ok = Glider.Structure.install(db)
 
     for {fun, procedure} <- [
           {fn -> Glider.Changes.status(db) end, "changes.status"},
           {fn -> Glider.Changes.release(db, rev) end, "changes.release"},
           {fn -> Glider.Changes.cap(db, 1_000) end, "changes.cap"},
-          {fn -> Glider.Check.run(db) end, "check.run"}
+          {fn -> Glider.Check.run(db) end, "check.run"},
+          {fn -> Glider.Structure.colors(db, store: "c") end, "structure.colors"},
+          {fn -> Glider.Structure.read(db, "c") end, "structure.read"},
+          {fn -> Glider.Structure.classes(db) end, "structure.classes"},
+          {fn -> Glider.Structure.templates(db) end, "structure.templates"},
+          {fn -> Glider.Structure.paths(db) end, "structure.paths"},
+          {fn -> Glider.Structure.plan(db, store: "p") end, "structure.plan"},
+          {fn -> Glider.Structure.compact(db, [], "p") end, "structure.plan"},
+          {fn -> Glider.Structure.dictionaries(db) end, "structure.dictionaries"}
         ] do
       {:ok, _} = fun.()
 
