@@ -174,9 +174,13 @@ defmodule Glider.Replication do
     do: Native.replication_listing(url, generation, native_opts(opts))
 
   @doc "Committed log of `source` (a path, or a memory graph's handle) not yet at `url`, in bytes."
-  @spec lag(Path.t() | Glider.db(), url(), keyword()) :: {:ok, non_neg_integer()} | {:error, String.t()}
+  @spec lag(Path.t() | Glider.db(), url(), keyword()) ::
+          {:ok, non_neg_integer()} | {:error, String.t()}
   def lag(source, url, opts \\ [])
-  def lag(db, url, opts) when is_reference(db), do: Native.memory_replication_lag(db, url, native_opts(opts))
+
+  def lag(db, url, opts) when is_reference(db),
+    do: Native.memory_replication_lag(db, url, native_opts(opts))
+
   def lag(path, url, opts), do: Native.replication_lag(to_string(path), url, native_opts(opts))
 
   @doc """

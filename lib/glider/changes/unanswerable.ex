@@ -10,8 +10,10 @@ defmodule Glider.Changes.Unanswerable do
   `Glider.Changes.stream/3` raises it.
 
     * `revision` - the revision asked about.
-    * `oldest` - the oldest revision the journal answers for now; `nil`
-      while it is starting again (`reason: :restarting`).
+    * `oldest` - the oldest revision the journal answers for now. Always
+      set for `:below_oldest`; `nil` while it is starting again
+      (`reason: :restarting`), and for `:ahead` only if the journal's
+      status could not be read just after.
     * `reason` - `:below_oldest` (older than `oldest`), `:ahead` (past this
       database's own revision: another line of history, or a later state of
       a copy), or `:restarting` (the journal holds positions past the

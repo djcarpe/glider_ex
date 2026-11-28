@@ -59,7 +59,7 @@ defmodule Glider.Changes do
   naming the engine procedure (`"changes.since"`, ...).
   """
 
-  alias Glider.Changes.{Change, Slice, Status, Unanswerable}
+  alias Glider.Changes.{Change, InTransaction, Slice, Status, Unanswerable}
   alias Glider.Procedure
 
   @max_rows 10_000
@@ -76,25 +76,46 @@ defmodule Glider.Changes do
   """
   @spec install(Glider.db(), keyword()) :: :ok | {:error, String.t()}
   def install(db, opts \\ []) do
-    with {:ok, args, budget} <- Procedure.split(opts, [:cap], "Glider.Changes.install/2") do
-      case Keyword.get(args, :cap) do
-        nil ->
-          Glider.create_extension(db, "changes")
+    with {:ok, args, budget} <- Procedure.split(opts, [:cap], "Glider.Changes.install/2"),
+         :ok <- cap_value(Keyword.get(args, :cap)) do
+      Procedure.span(db, "changes.install", fn ->
+        do_install(db, Keyword.get(args, :cap), budget)
+      end)
+    end
+  end
 
-        cap ->
-          Glider.transaction(db, fn ->
-            with :ok <- Glider.create_extension(db, "changes"),
-                 {:ok, _} <- cap(db, cap, budget) do
-              :ok
-            else
-              {:error, reason} -> Glider.rollback(db, reason)
-            end
-          end)
-          |> case do
-            {:ok, :ok} -> :ok
-            {:error, reason} -> {:error, reason}
-          end
+  defp cap_value(nil), do: :ok
+  defp cap_value(n) when is_integer(n) and n >= 64, do: :ok
+  defp cap_value(n), do: {:error, "cap: must be a whole number at least 64, got: #{inspect(n)}"}
+
+  defp do_install(db, nil, budget), do: create(db, budget)
+
+  # The install and the cap in one transaction. Inside the caller's own,
+  # both join it, and a refusal is returned, not thrown through the caller.
+  defp do_install(db, cap, budget) do
+    steps = fn ->
+      with :ok <- create(db, budget), {:ok, _} <- cap(db, cap, budget), do: :ok
+    end
+
+    if Glider.in_transaction?(db) do
+      steps.()
+    else
+      case Glider.transaction(db, fn ->
+             case steps.() do
+               :ok -> :ok
+               {:error, reason} -> Glider.rollback(db, reason)
+             end
+           end) do
+        {:ok, :ok} -> :ok
+        {:error, reason} -> {:error, reason}
       end
+    end
+  end
+
+  defp create(db, budget) do
+    case Procedure.statement(db, "CREATE EXTENSION IF NOT EXISTS changes", [], nil, budget) do
+      {:ok, _} -> :ok
+      {:error, _} = error -> error
     end
   end
 
@@ -112,8 +133,17 @@ defmodule Glider.Changes do
 
   Changes come by kind (node, edge, adjacency), then id, each id once per
   kind with its latest change. A slice with `after: nil` is the last, and
-  its `complete_up_to` is the database's position it is complete up to;
-  otherwise call again with `after: slice.after`.
+  its `complete_up_to` is the committed revision it is complete up to,
+  never more than `Glider.revision/2` says (the binding checks it); keep
+  it and ask from it next time. Otherwise call again with
+  `after: slice.after`.
+
+  Refused inside a transaction, with
+  `{:error, %Glider.Changes.InTransaction{}}`, before anything reaches the
+  engine and without touching the transaction: there the journal would
+  list the transaction's own pending writes and a position that may never
+  be committed. Another process's call waits for an open transaction to
+  end, as every call does, and then answers about what was committed.
 
       {:ok, %Glider.Changes.Slice{changes: [%Glider.Changes.Change{kind: :node, id: 7, change: :put}]}} =
         Glider.Changes.since(db, rev)
@@ -125,20 +155,46 @@ defmodule Glider.Changes do
   When the journal cannot answer for `revision`, the result is
   `{:error, %Glider.Changes.Unanswerable{}}` (see the moduledoc); any other
   failure (the journal not installed, a bad argument) is
-  `{:error, reason}` with a string.
+  `{:error, reason}` with a string. Options are checked before anything
+  is sent.
   """
   @spec since(Glider.db(), non_neg_integer(), keyword()) ::
-          {:ok, Slice.t()} | {:error, Unanswerable.t() | String.t()}
+          {:ok, Slice.t()} | {:error, Unanswerable.t() | InTransaction.t() | String.t()}
   def since(db, revision, opts \\ []) when is_integer(revision) and revision >= 0 do
     with {:ok, args, budget} <-
-           Procedure.split(opts, [:kinds, :limit, :after], "Glider.Changes.since/3") do
+           Procedure.split(opts, [:kinds, :limit, :after], "Glider.Changes.since/3"),
+         :ok <- Procedure.positive(Keyword.get(args, :limit), "limit:"),
+         :ok <- outside_transaction(db) do
       args = [revision: revision] ++ args
       max_rows = min(Keyword.get(args, :limit) || @max_rows, @max_rows)
 
       case Procedure.call(db, "changes.since", args, [max_rows: max_rows] ++ budget) do
-        {:ok, r} -> {:ok, slice(r)}
+        {:ok, r} -> committed(db, slice(r), budget)
         {:error, reason} -> {:error, unanswerable(db, revision, reason, budget)}
       end
+    end
+  end
+
+  defp outside_transaction(db) do
+    if Glider.in_transaction?(db), do: {:error, %InTransaction{}}, else: :ok
+  end
+
+  # A watermark handed to a caller is a committed revision: checked against
+  # the revision, which only grows, read after the answer.
+  defp committed(_db, %Slice{complete_up_to: nil} = slice, _budget), do: {:ok, slice}
+
+  defp committed(db, %Slice{complete_up_to: up_to} = slice, budget) do
+    case Glider.revision(db, budget) do
+      {:ok, rev} when up_to <= rev ->
+        {:ok, slice}
+
+      {:ok, rev} ->
+        {:error,
+         "changes.since said it was complete up to #{up_to}, past the committed revision #{rev}; " <>
+           "nothing is returned, since that position may never be committed"}
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -153,7 +209,8 @@ defmodule Glider.Changes do
   Takes the options of `since/3` except `:after`. Raises
   `Glider.Changes.Unanswerable` when the journal cannot answer for
   `revision`, from the first slice on (so on the first `Enum` call, never
-  as an empty stream), and `Glider.Error` on any other failure.
+  as an empty stream), `Glider.Changes.InTransaction` when consumed inside
+  a transaction, and `Glider.Error` on any other failure.
 
       db
       |> Glider.Changes.stream(rev, kinds: [:node])
@@ -179,6 +236,7 @@ defmodule Glider.Changes do
             {:ok, %Slice{changes: changes, after: nil}} -> {changes, :done}
             {:ok, %Slice{changes: changes, after: next}} -> {changes, {:next, next}}
             {:error, %Unanswerable{} = e} -> raise e
+            {:error, %InTransaction{} = e} -> raise e
             {:error, reason} -> raise Glider.Error, message: reason, query: "changes.since"
           end
       end,
@@ -199,7 +257,7 @@ defmodule Glider.Changes do
   @spec status(Glider.db(), keyword()) :: {:ok, Status.t()} | {:error, String.t()}
   def status(db, opts \\ []) do
     with {:ok, [], budget} <- Procedure.split(opts, [], "Glider.Changes.status/2"),
-         {:ok, r} <- Procedure.call(db, "changes.status", [], budget) do
+         {:ok, r} <- Procedure.call(db, "changes.status", [], [probe: true] ++ budget) do
       [[oldest, why, entries, bytes, cap, revision]] = r.rows
 
       {:ok,
@@ -282,10 +340,15 @@ defmodule Glider.Changes do
       end
 
     {oldest, why} =
-      case {reason, status(db, budget)} do
-        {:restarting, _} -> {nil, nil}
-        {_, {:ok, s}} -> {s.oldest, s.why}
-        {_, {:error, _}} -> {floor_in(message), nil}
+      case reason do
+        :restarting ->
+          {nil, nil}
+
+        _ ->
+          case status(db, budget) do
+            {:ok, s} -> {s.oldest, s.why}
+            {:error, _} -> {floor_in(message), nil}
+          end
       end
 
     %Unanswerable{revision: revision, oldest: oldest, reason: reason, why: why, message: message}

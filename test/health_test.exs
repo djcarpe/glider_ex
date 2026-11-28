@@ -66,7 +66,8 @@ defmodule Glider.HealthTest do
   end
 
   @tag :tmp_dir
-  test "reports a storage read error the engine recorded, once", %{tmp_dir: dir} do
+  test "reports a storage read error the engine recorded, and leaves it for the next statement",
+       %{tmp_dir: dir} do
     src = Path.join(dir, "src.gldb")
     {:ok, db} = Glider.open(src)
 
@@ -97,6 +98,15 @@ defmodule Glider.HealthTest do
               _ = Glider.export_jsonl(db)
               {:ok, %Health{read_error: first}} = Glider.health(db)
               {:ok, %Health{read_error: second}} = Glider.health(db)
+
+              if first do
+                # the next statement is still told, once
+                assert {:error, "database image is damaged: " <> _} =
+                         Glider.query(db, "MATCH (n) RETURN count(n)")
+
+                assert {:ok, %Health{read_error: nil}} = Glider.health(db)
+              end
+
               Glider.close(db)
               if first, do: [{p, first, second} | acc], else: acc
           end
@@ -106,7 +116,7 @@ defmodule Glider.HealthTest do
 
     for {_p, first, second} <- reported do
       assert first =~ "checksum mismatch"
-      assert second == nil
+      assert second == first
     end
   end
 end

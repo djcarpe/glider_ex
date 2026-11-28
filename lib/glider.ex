@@ -291,8 +291,8 @@ defmodule Glider do
              Keyword.get(opts, :max_rows, 10_000),
              bytes(Keyword.get(opts, :max_bytes, 8 <<< 20)),
              Keyword.get(opts, :graph, false),
-             budget(opts, :max_millis),
-             budget(opts, :max_steps)
+             {budget(opts, :max_millis), budget(opts, :max_steps)},
+             false
            ) do
       {:ok, to_result(result)}
     end
@@ -388,6 +388,9 @@ defmodule Glider do
   Stream JSONL from a server-side file. Keys and ids are remapped on disk.
   `:max_record_bytes` defaults to 1 MiB, bounded by work_mem. Each 1,000-op
   slice commits atomically; an error rolls back the current slice.
+
+  Refused inside `transaction/2` (it commits on its own, which would commit
+  the transaction's pending writes); the refusal aborts the transaction.
   """
   def import_file(db, path, opts \\ []) do
     case Native.import_file(db, path, bytes(Keyword.get(opts, :max_record_bytes, 1 <<< 20))) do
@@ -400,6 +403,9 @@ defmodule Glider do
   Apply one atomic slice of at most 1,000 `{cypher, params}` writes. One native
   call and one commit per slice. Errors roll back the whole slice. Call between
   slices to allow queries through; explicit transaction controls are rejected.
+
+  Refused inside `transaction/2`, where it would commit on its own; the
+  refusal aborts the transaction. Run it before or after.
   """
   def write_batch(db, statements) when is_list(statements) and length(statements) <= 1000 do
     statements = Enum.map(statements, fn {q, params} -> {q, Map.to_list(stringify(params))} end)
@@ -504,6 +510,8 @@ defmodule Glider do
   Nothing in it commits before it ends: operations that commit on their own
   (`COMPACT`, `import_jsonl/2`, `import_file/3`, `write_batch/2`) are
   refused inside it with an error, which aborts it like any other. The
+  imports and the batch were refused before too; `COMPACT` used to run and
+  commit the transaction's pending writes, and is now refused. The
   engine sees the transaction start (glider's `Graph::begin()`), so one it
   rolled back itself (a failed write hook, a memory graph past
   `:max_memory`) cannot commit in part either.
@@ -585,6 +593,9 @@ defmodule Glider do
 
       {"type":"node","id":1,"labels":["Person"],"props":{"name":"Ada"}}
       {"type":"edge","from":1,"to":2,"label":"KNOWS","props":{}}
+
+  Refused inside `transaction/2` (an import commits on its own); the
+  refusal aborts the transaction.
   """
   @spec import_jsonl(db(), String.t()) ::
           {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, String.t()}
@@ -710,10 +721,12 @@ defmodule Glider do
   thousand; at most its cap); `changes: false` leaves the journal out.
   `:max_millis` and `:max_steps` are passed to every statement it runs.
 
-  A read error is a page that failed to read (a checksum, a short file):
-  the engine records the first one, reports it once, and the statement
-  that meets it fails. `health` reports one that is pending and so clears
-  it; the damage itself stays, so run `glider <db> verify`.
+  A read error is a page that failed to read (a checksum, a short file).
+  The engine records the first one and the next statement fails with it.
+  `health` reports it in full and leaves it in place, so that statement
+  still fails; run `glider <db> verify`. Inside a transaction it changes
+  nothing: none of its statements writes, and none of their failures
+  aborts the transaction.
 
   What it does not tell you: whether the graph is whole. Counters can
   disagree with the records, an edge can point at a node that is gone, and
@@ -723,10 +736,13 @@ defmodule Glider do
   @spec health(db(), keyword()) :: {:ok, Glider.Health.t()} | {:error, String.t()}
   def health(db, opts \\ []) do
     with {:ok, args, budget} <- Glider.Procedure.split(opts, [:changes], "Glider.health/2"),
-         {:ok, stats} <- stats_bounded(db, budget, "Glider.health/2"),
-         {:ok, installed, read_error} <- installed_extensions(db, budget),
+         probe = [probe: true] ++ budget,
+         {:ok, read_error} <- Native.read_error(db),
+         {:ok, stats} <- stats_bounded(db, probe, "Glider.health/2"),
+         {:ok, installed} <- installed_extensions(db, probe),
          {:ok, changes} <-
-           changes_status(db, installed, Keyword.get(args, :changes, true), budget) do
+           changes_status(db, installed, Keyword.get(args, :changes, true), budget),
+         {:ok, later} <- Native.read_error(db) do
       memory =
         stats["memory_bytes"] ||
           (stats["cached_pages"] && stats["page_size"] &&
@@ -744,41 +760,29 @@ defmodule Glider do
          log_bytes: stats["log_bytes"],
          extensions: installed,
          changes: changes,
-         read_error: stats["integrity_error"] || read_error
+         read_error: stats["integrity_error"] || read_error || later
        }}
     end
   end
 
   defp stats_bounded(db, opts, what) do
+    {probe, opts} = Keyword.split(opts, [:probe])
+
     with {:ok, [], budget} <- Glider.Procedure.split(opts, [], what),
-         {:ok, r} <- Glider.Procedure.statement(db, "STATS", [], nil, budget) do
+         {:ok, r} <- Glider.Procedure.statement(db, "STATS", [], nil, probe ++ budget) do
       {:ok, Map.new(r.rows, fn [k, v] -> {k, v} end)}
     end
   end
 
-  # STATS leaves a recorded read error in place; every other statement
-  # reports it instead of running, and clears it. So the first other
-  # statement health runs is the one that learns of it, and runs again.
-  defp installed_extensions(db, budget, read_error \\ nil) do
-    case Glider.Procedure.statement(db, "SHOW EXTENSIONS", [], nil, budget) do
-      {:ok, r} ->
-        installed =
-          for [name, _available, version, _summary] <- r.rows,
-              version != nil,
-              do: %{name: name, version: version}
-
-        {:ok, installed, read_error}
-
-      {:error, "database image is damaged: " <> rest} when read_error == nil ->
-        installed_extensions(db, budget, damage(rest))
-
-      {:error, _} = error ->
-        error
+  defp installed_extensions(db, opts) do
+    with {:ok, r} <- Glider.Procedure.statement(db, "SHOW EXTENSIONS", [], nil, opts) do
+      {:ok,
+       for(
+         [name, _available, version, _summary] <- r.rows,
+         version != nil,
+         do: %{name: name, version: version}
+       )}
     end
-  end
-
-  defp damage(rest) do
-    rest |> String.split(". Run `glider <db> verify`", parts: 2) |> hd()
   end
 
   defp changes_status(db, installed, true, budget) do

@@ -191,6 +191,11 @@ db |> Glider.Check.stream(limit: 100_000) |> Stream.flat_map(& &1.findings) |> E
 {:ok, %Glider.Health{revision: rev, read_error: nil, changes: journal}} = Glider.health(db)
 ```
 
+`Glider.Changes.since/3` and `stream/3` are refused inside a transaction
+(`{:error, %Glider.Changes.InTransaction{}}`), where the journal would list
+the transaction's own pending writes; a `complete_up_to` they hand back is
+always a committed revision.
+
 The journal never answers "nothing changed" when it cannot answer: asked
 about a revision it no longer (or never) covers, `since/3` returns
 `{:error, %Glider.Changes.Unanswerable{}}` with the oldest revision it does
@@ -206,7 +211,9 @@ label, index or counter at fault).
 `Glider.health/2` runs no scan of the graph (the change journal's status
 counts its own entries; `changes: false` leaves it out) and so cannot say
 whether the graph is whole: that is `Glider.Check.run/2`. It reports a
-storage read error the engine has recorded and not yet reported.
+storage read error the engine has recorded and not yet reported, in full,
+and leaves it for the next statement to fail with; inside a transaction it
+changes nothing.
 
 Every one of these takes `:max_millis` and `:max_steps` and passes them to
 the engine; procedures obey them from the engine version whose procedures
@@ -363,6 +370,21 @@ the interval between passes. The log is held in memory until it is shipped,
 up to `:log_cap` (64M by default); past it the next pass takes a new base.
 A memory graph opened without `log: true` keeps no log and cannot be
 replicated, and pays nothing for it.
+
+## Upgrading
+
+Notes for code written against earlier versions of this binding:
+
+- `COMPACT` inside `Glider.transaction/2` is now refused, and the refusal
+  aborts the transaction. It used to run and commit the transaction's
+  pending writes, so a rollback afterwards undid nothing. Run it outside a
+  transaction. (`import_jsonl/2`, `import_file/3` and `write_batch/2` were
+  already refused inside one; they now say why.)
+- A process killed while it waits to begin a transaction no longer leaves
+  the handle owned by a dead process: it takes nothing, and the next
+  waiter gets the handle.
+- `Glider.stats/1` carries `"revision"` and `"generation"`: two databases
+  with the same graph no longer compare equal as whole maps.
 
 ## Writing queries in Elixir source
 

@@ -64,9 +64,23 @@ defmodule Glider.Check do
   # 10,000 findings a call, and the summary rows of the checks it ran.
   @max_rows 10_016
 
-  @doc "Install the extension in this database (a no-op if it already is)."
-  @spec install(Glider.db()) :: :ok | {:error, String.t()}
-  def install(db), do: Glider.create_extension(db, "check")
+  @doc """
+  Install the extension in this database (a no-op if it already is).
+  Takes `:max_millis` and `:max_steps`.
+
+      :ok = Glider.Check.install(db)
+  """
+  @spec install(Glider.db(), keyword()) :: :ok | {:error, String.t()}
+  def install(db, opts \\ []) do
+    with {:ok, [], budget} <- Procedure.split(opts, [], "Glider.Check.install/2") do
+      Procedure.span(db, "check.install", fn ->
+        case Procedure.statement(db, "CREATE EXTENSION IF NOT EXISTS check", [], nil, budget) do
+          {:ok, _} -> :ok
+          {:error, _} = error -> error
+        end
+      end)
+    end
+  end
 
   @doc """
   Run the checks, or one slice of them.
@@ -94,6 +108,7 @@ defmodule Glider.Check do
   @spec run(Glider.db(), keyword()) :: {:ok, Report.t()} | {:error, String.t()}
   def run(db, opts \\ []) do
     with {:ok, args, budget} <- Procedure.split(opts, @args, "Glider.Check.run/2"),
+         :ok <- Procedure.positive(Keyword.get(args, :limit), "limit:"),
          {:ok, r} <- Procedure.call(db, "check.run", args, [max_rows: @max_rows] ++ budget) do
       {:ok, report(r)}
     end
