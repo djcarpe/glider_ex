@@ -21,7 +21,12 @@
 //!    process as the owner; calls from any other process wait until it
 //!    commits or rolls back, so nobody sees or joins half a transaction. The
 //!    owner is monitored: if it dies mid-transaction, the transaction is
-//!    rolled back and the handle freed.
+//!    rolled back and the handle freed. It is opened with the engine's
+//!    `Graph::begin()`, so the engine can see it start and end: an operation
+//!    that commits on its own (`COMPACT`, an import, a batch) is refused
+//!    inside it instead of committing its pending writes, and a block the
+//!    engine rolled back (a failed write or hook, a full memory graph) is
+//!    spent until it ends, so no part of it can commit.
 //!
 //! Results are built as native Erlang terms rather than JSON. Every fallible
 //! NIF returns `Result<_, String>`, which rustler encodes as `{:ok, _}` or
@@ -103,8 +108,8 @@ impl Resource for DbResource {
         let mut st = self.lock();
         if st.owner.as_ref().map(|(p, _)| *p == pid).unwrap_or(false) {
             if let Some(g) = st.graph.as_mut() {
+                // Ends the `begin()` block too.
                 let _ = g.rollback();
-                g.autocommit = true;
             }
             st.owner = None;
             st.aborted = false;
@@ -1101,7 +1106,8 @@ fn begin(env: Env, db: ResourceArc<DbResource>) -> Result<Atom, String> {
     let Some(g) = st.graph.as_mut() else {
         return Err("this graph is closed".into());
     };
-    g.autocommit = false;
+    // A block the engine can see, not `autocommit = false`: see the header.
+    g.begin().map_err(|e| e.to_string())?;
     let mon = env.monitor(&db, &caller);
     st.owner = Some((caller, mon));
     st.aborted = false;
@@ -1117,13 +1123,12 @@ fn end_tx(env: Env, db: &ResourceArc<DbResource>, commit: bool) -> Result<Atom, 
     let aborted = st.aborted;
     let r = match st.graph.as_mut() {
         Some(g) => {
-            let r = if commit && !aborted {
+            // Either ends the `begin()` block and puts autocommit back.
+            if commit && !aborted {
                 g.commit().map_err(|e| e.to_string())
             } else {
                 g.rollback().map_err(|e| e.to_string())
-            };
-            g.autocommit = true;
-            r
+            }
         }
         None => Ok(()),
     };
