@@ -57,6 +57,8 @@ mix test
 | `Glider.health/2` | one cheap call before relying on a graph: revision, counts, memory, extensions, the change journal, read errors |
 | `Glider.Changes` | what changed since a revision: `install/2`, `since/3`, `stream/3`, `status/2`, `release/3`, `cap/3` |
 | `Glider.Check` | is the graph whole: `install/1`, `run/2`, `stream/2` |
+| `Glider.Structure` | which nodes are built alike and which shapes repeat: `colors/2`, `classes/2`, kept colourings (`read/3`, `stored/2`, `drop/3`), `templates/2`, `expand/3`, `paths/2`, `plan/2`, kept dictionaries (`dictionaries/2`, `drop_dictionary/3`), `stream/3` |
+| `Glider.Structure.compact/4`, `dictionary_text/3` | a selection of nodes in the compact notation `glider-compact/1`, written with a kept dictionary, and the dictionary's own text |
 | `Glider.checkpoint/1` | fold the write-ahead log into the pages |
 | `Glider.poll_replication/1` | serve a replicator's request on an idle handle |
 | `Glider.close/1` | release the graph and its file lock |
@@ -151,7 +153,7 @@ The functions work in queries too: `RETURN context.card(p)`, and
 passed as parameters and checked against the procedure's; see glider's
 `docs/EXTENSIONS.md` for all of them.
 
-## Derived data: revision, changes, checks, health
+## Derived data: revision, changes, checks, structure, health
 
 Things kept beside a graph and computed from it (embeddings that cost money,
 summaries, compiled text for a model) are kept right by jobs that ask three
@@ -166,15 +168,16 @@ and is the graph whole.
 :ok = Glider.Changes.install(db, cap: 1_000_000)
 
 case Glider.Changes.since(db, kept_revision) do
-  {:ok, %Glider.Changes.Slice{changes: changes, after: nil, complete_up_to: now}} ->
+  {:ok, %Glider.Changes.Slice{complete: true, changes: changes, complete_up_to: now}} ->
     reembed(for %{kind: :node, change: :put, id: id} <- changes, do: id)
     keep(now)
 
-  {:ok, %Glider.Changes.Slice{after: cursor}} ->
-    # more than one slice: call again with after: cursor, or use stream/3
+  {:ok, %Glider.Changes.Slice{complete: false, after: cursor}} ->
+    # more than one slice: call again with after: cursor (opaque, as given),
+    # or use stream/3
 
-  {:error, %Glider.Changes.Unanswerable{oldest: oldest}} ->
-    # the journal cannot say (installed later, released, capped, CLEAR):
+  {:error, %Glider.Changes.Unanswerable{reason: reason, oldest: oldest}} ->
+    # the journal cannot say (:installed later, :released, :cap, :cleared, ...):
     # rebuild from a scan, then carry on from `oldest` or later
     rebuild_all()
 end
@@ -187,20 +190,49 @@ db |> Glider.Changes.stream(kept_revision) |> Stream.chunk_every(100) |> Enum.ea
 {:ok, %Glider.Check.Report{findings: []}} = Glider.Check.run(db)
 db |> Glider.Check.stream(limit: 100_000) |> Stream.flat_map(& &1.findings) |> Enum.to_list()
 
+# which nodes are the same shape? describe a selection shortly and exactly
+:ok = Glider.Structure.install(db)
+{:ok, %Glider.Structure.Plan{}} = Glider.Structure.plan(db, types: ["HAS_SIDE", "HAS_ELEMENT"], store: "plant")
+{:ok, dictionary} = Glider.Structure.dictionary_text(db, "plant")   # give it to a model once
+{:ok, %Glider.Structure.Compact{text: text, hash: hash, fresh: true}} =
+  Glider.Structure.compact(db, station_node_ids, "plant")             # "# glider-compact/1 dictionary <hash>"
+
 # before relying on it at all
 {:ok, %Glider.Health{revision: rev, read_error: nil, changes: journal}} = Glider.health(db)
 ```
 
-`Glider.Changes.since/3` and `stream/3` are refused inside a transaction
-(`{:error, %Glider.Changes.InTransaction{}}`), where the journal would list
-the transaction's own pending writes; a `complete_up_to` they hand back is
-always a committed revision.
+Everything about an answer in slices (`Glider.Changes.since/3`,
+`Glider.Check.run/2` and the sliced `Glider.Structure` calls) is read from
+the row the engine ends it with: whether it answered, whether the slice is
+complete, the one cursor to continue from and, for the journal, the
+watermark it is complete up to. Nothing is read from the engine's message.
+A cursor is opaque: pass it back exactly as given, with the same other
+options, to the same database. The streams follow it and stop on the slice
+that says it is complete.
 
 The journal never answers "nothing changed" when it cannot answer: asked
 about a revision it no longer (or never) covers, `since/3` returns
-`{:error, %Glider.Changes.Unanswerable{}}` with the oldest revision it does
-cover, and `stream/3` raises it on first use. An empty list of changes always
-means nothing changed.
+`{:error, %Glider.Changes.Unanswerable{}}` with the engine's reason
+(`:not_installed`, `:installed`, `:released`, `:cap`, `:cleared`, `:reset`,
+`:ahead`, `:restarting`) and the oldest revision it does cover, and
+`stream/3` raises it from whichever slice meets it, also when the journal
+stops answering between two slices. An empty list of changes always means
+nothing changed.
+
+Inside a transaction `since/3` and `stream/3` answer about committed
+changes only: the transaction's pending writes are not listed, the
+watermark is the committed revision (never a position a rollback could take
+back), and a question that cannot be answered does not abort the
+transaction. The watermark of an answer in slices is its first slice's, so
+a change committed between two slices to an id already passed is listed by
+the next question from it.
+
+`Glider.Structure` reports and never merges. Rows are maps keyed by the
+engine's column names; kept colourings and dictionaries say the revision
+they were made at and whether they are fresh, and `fresh: :require` refuses
+a stale one with `{:error, %Glider.Structure.Stale{}}`. A compact text
+written with a kept dictionary names it by hash and does not repeat it; a
+stale dictionary costs uses, never truth.
 
 `Glider.Check.run/2` reports and never repairs. With no `:checks` it runs the
 six checks of the database (findings of severity `:fault`); `:duplicates`,

@@ -3,7 +3,7 @@ defmodule Glider.ReviewX1Test do
   # assert the fixed behaviour.
   use ExUnit.Case, async: true
 
-  alias Glider.Changes.{InTransaction, Slice, Unanswerable}
+  alias Glider.Changes.Unanswerable
 
   defp count(db) do
     {:ok, %{"nodes" => n}} = Glider.stats(db)
@@ -11,38 +11,12 @@ defmodule Glider.ReviewX1Test do
   end
 
   # ---------------------------------------------- 1: watermarks are committed
+  #
+  # Since the engine reads the committed journal inside a transaction, since/3
+  # answers there again (the InTransaction refusal is gone); the losses are
+  # shown not to happen in test/watermark_test.exs.
 
-  @tag :tmp_dir
-  test "a watermark read inside a transaction that rolls back cannot hide committed changes",
-       %{tmp_dir: dir} do
-    {:ok, db} = Glider.open(Path.join(dir, "p.gldb"))
-    :ok = Glider.Changes.install(db)
-    Glider.run!(db, "CREATE (:Seed)")
-    {:ok, rev0} = Glider.revision(db)
-
-    {:error, :undo} =
-      Glider.transaction(db, fn ->
-        for i <- 1..20, do: Glider.run!(db, "CREATE (:Pending {i: $i})", i: i)
-        # refused before reaching the engine, and the transaction is untouched
-        assert {:error, %InTransaction{}} = Glider.Changes.since(db, rev0)
-        assert_raise InTransaction, fn -> Enum.to_list(Glider.Changes.stream(db, rev0)) end
-        assert {:ok, 1} = Glider.run(db, "CREATE (:StillWritable)")
-        Glider.rollback(db, :undo)
-      end)
-
-    # outside: the watermark is the committed revision
-    {:ok, %Slice{complete_up_to: kept}} = Glider.Changes.since(db, rev0)
-    {:ok, rev_after} = Glider.revision(db)
-    assert kept == rev_after
-
-    for i <- 1..40, do: Glider.run!(db, "CREATE (:Later {i: $i})", i: i)
-    {:ok, now} = Glider.revision(db)
-    {:ok, %Slice{changes: changes, complete_up_to: up_to}} = Glider.Changes.since(db, kept)
-    assert up_to <= now
-    assert length(Enum.filter(changes, &(&1.kind == :node))) == 40
-  end
-
-  test "a refused since inside a transaction leaves it to commit" do
+  test "a question that cannot be answered inside a transaction leaves it to commit" do
     {:ok, db} = Glider.open()
     :ok = Glider.Changes.install(db)
     Glider.run!(db, "CREATE (:A)")
@@ -54,11 +28,11 @@ defmodule Glider.ReviewX1Test do
         Glider.Changes.since(db, rev + 1_000_000)
       end)
 
-    assert {:ok, {:error, %InTransaction{}}} = tx
+    assert {:ok, {:error, %Unanswerable{reason: :ahead}}} = tx
     assert count(db) == 2
   end
 
-  test "an Unanswerable outside a transaction always carries oldest unless restarting" do
+  test "an Unanswerable carries the oldest answerable revision where the engine names one" do
     {:ok, db} = Glider.open()
     Glider.run!(db, "CREATE (:A)")
     :ok = Glider.Changes.install(db)
@@ -67,7 +41,7 @@ defmodule Glider.ReviewX1Test do
     assert {:error, %Unanswerable{reason: :ahead, oldest: o1}} =
              Glider.Changes.since(db, rev + 1_000_000)
 
-    assert {:error, %Unanswerable{reason: :below_oldest, oldest: o2}} =
+    assert {:error, %Unanswerable{reason: :installed, oldest: o2}} =
              Glider.Changes.since(db, 0)
 
     assert is_integer(o1) and is_integer(o2)
@@ -354,6 +328,50 @@ defmodule Glider.ReviewX1Test do
       assert count(db) == 0, "#{name} committed"
       Glider.close(db)
     end
+  end
+
+  # ------------------------------------------------- lows left by the review
+
+  test "revision/2 and generation/2 refuse an option they do not document, by name" do
+    {:ok, db} = Glider.open()
+    assert {:error, "Glider.revision/2 has no option :probe"} = Glider.revision(db, probe: true)
+
+    assert {:error, "Glider.generation/2 has no option :probe"} =
+             Glider.generation(db, probe: true)
+
+    assert {:ok, _} = Glider.revision(db, max_steps: 100)
+  end
+
+  @tag :tmp_dir
+  test "stats reports a recorded read error the same whether or not health ran first",
+       %{tmp_dir: dir} do
+    path = damaged(dir)
+    assert path
+
+    seen =
+      for health_first <- [false, true] do
+        {:ok, db} = Glider.open(path)
+        _ = Glider.export_jsonl(db)
+
+        reported =
+          if health_first do
+            {:ok, %Glider.Health{read_error: e}} = Glider.health(db)
+            e
+          end
+
+        {:ok, %{"integrity_error" => error}} = Glider.stats(db)
+        assert reported in [nil, error]
+        # left in place: stats again, and the next statement still fails with it
+        {:ok, %{"integrity_error" => ^error}} = Glider.stats(db)
+
+        assert {:error, "database image is damaged: " <> _} =
+                 Glider.query(db, "MATCH (n) RETURN n")
+
+        Glider.close(db)
+        error
+      end
+
+    assert [same, same] = seen
   end
 
   def forward(_event, _measurements, %{db: db} = meta, {test, db}), do: send(test, {:stop, meta})

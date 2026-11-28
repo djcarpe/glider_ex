@@ -38,8 +38,12 @@ defmodule Glider.Check do
   ## Slices
 
   `:limit` caps the records one call looks at, and a call also stops at
-  10,000 findings. A call that stops returns a report with `after:` set;
-  pass it back as `after:` with the same other options to carry on, or use
+  9,990 findings. Whether a report ends the run and where the next slice
+  starts are read from the engine's end row, never its message: a call
+  that stops returns a report with `complete: false` and `after:` set to
+  the end row's cursor, which is opaque; pass it back exactly as given as
+  `after:` with the same other options to carry on (with other options the
+  engine refuses it), or use
   `stream/2`, which does that and frees the handle between slices. Slices
   together report exactly what one whole run reports. A cursor is a
   position, not a snapshot: writes between slices give an answer about a
@@ -95,12 +99,14 @@ defmodule Glider.Check do
     * `:type`, `:dir` - for `:required`, the edge type each node of `label`
       must have, and its direction (`:out`, the default, `:in`, `:both`).
     * `:limit` - the most records this call looks at.
-    * `:after` - carry on from the `after` of the previous report.
+    * `:after` - carry on from the `after` of the previous report, as given.
     * `:max_millis`, `:max_steps` - the statement budget.
 
   Returns a `Glider.Check.Report`: the findings in the order the checks met
   them, one `Glider.Check.Summary` per check this call ran or stopped in,
-  and `after`, `nil` when the run is complete.
+  `complete`, and `after`, `nil` when the run is complete. It writes
+  nothing, and inside a transaction a refusal (a bad argument) does not
+  abort the transaction.
 
       {:ok, %Glider.Check.Report{findings: [%Glider.Check.Finding{severity: :fault, id: "e2"}]}} =
         Glider.Check.run(db)
@@ -109,8 +115,9 @@ defmodule Glider.Check do
   def run(db, opts \\ []) do
     with {:ok, args, budget} <- Procedure.split(opts, @args, "Glider.Check.run/2"),
          :ok <- Procedure.positive(Keyword.get(args, :limit), "limit:"),
-         {:ok, r} <- Procedure.call(db, "check.run", args, [max_rows: @max_rows] ++ budget) do
-      {:ok, report(r)}
+         {:ok, a} <-
+           Procedure.sliced(db, "check.run", args, [max_rows: @max_rows, probe: true] ++ budget) do
+      report(a)
     end
   end
 
@@ -134,43 +141,35 @@ defmodule Glider.Check do
 
     opts = Keyword.put_new(opts, :limit, 10_000)
 
-    Stream.resource(
-      fn -> {:next, nil} end,
-      fn
-        :done ->
-          {:halt, :done}
-
-        {:next, cursor} ->
-          case run(db, Keyword.put(opts, :after, cursor)) do
-            {:ok, %Report{after: nil} = report} -> {[report], :done}
-            {:ok, %Report{after: next} = report} -> {[report], {:next, next}}
-            {:error, reason} -> raise Glider.Error, message: reason, query: "check.run"
-          end
+    Procedure.stream(
+      fn cursor ->
+        with {:ok, report} <- run(db, Keyword.put(opts, :after, cursor)),
+             do: {:ok, [report], %{answered: true, complete: report.complete, next: report.after}}
       end,
-      fn _ -> :ok end
+      fn e ->
+        raise Glider.Error, message: "check.run did not answer: #{inspect(e)}", query: "check.run"
+      end,
+      fn reason -> raise Glider.Error, message: reason, query: "check.run" end
     )
   end
 
   # ------------------------------------------------------------------ private
 
-  defp report(r) do
+  defp report(%{end: %{answered: false} = e}),
+    do: {:error, "check.run did not answer (#{e.reason})"}
+
+  defp report(%{rows: rows, end: e, message: message}) do
     {summaries, findings} =
-      Enum.split_with(r.rows, fn [_check, severity | _] -> severity == "summary" end)
+      Enum.split_with(rows, fn [_check, severity | _] -> severity == "summary" end)
 
-    summaries = Enum.map(summaries, &summary/1)
-
-    after_ =
-      Enum.find_value(summaries, fn
-        %Summary{status: :partial, cursor: cursor} -> cursor
-        _ -> nil
-      end)
-
-    %Report{
-      findings: Enum.map(findings, &finding/1),
-      summaries: summaries,
-      after: after_,
-      message: r.message
-    }
+    {:ok,
+     %Report{
+       findings: Enum.map(findings, &finding/1),
+       summaries: Enum.map(summaries, &summary/1),
+       complete: e.complete,
+       after: if(e.complete, do: nil, else: e.next),
+       message: message
+     }}
   end
 
   defp finding([check, severity, kind, id, detail]) do

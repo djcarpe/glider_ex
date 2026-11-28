@@ -655,7 +655,10 @@ defmodule Glider do
   `:hot_size` adds the hot set's counters: `"hot_capacity"`, `"hot_pages"`,
   `"hot_hits"`, `"promotions"`, `"demotions"` and `"prewarmed"` (pages
   loaded at open from the list a previous open left). The page cache's
-  traffic is in `Glider.Telemetry.metrics/1`.
+  traffic is in `Glider.Telemetry.metrics/1`. When the engine has
+  recorded a storage read error, `"integrity_error"` holds it, whether or
+  not `health/2` saw it first; it is left in place, so the next statement
+  still fails with it.
 
   Two databases holding the same graph report the same counts, but not
   necessarily the same revision, generation or sizes: those describe the
@@ -663,8 +666,13 @@ defmodule Glider do
   """
   @spec stats(db()) :: {:ok, map()} | {:error, String.t()}
   def stats(db) do
-    with {:ok, r} <- query(db, "STATS") do
-      {:ok, Map.new(r.rows, fn [k, v] -> {k, v} end)}
+    # A read error the engine recorded is moved onto the handle first (as
+    # health/2 does), so it is reported here the same whether or not a
+    # probe took it from the engine before; it stays for the next statement.
+    with {:ok, kept} <- Native.read_error(db),
+         {:ok, r} <- query(db, "STATS") do
+      stats = Map.new(r.rows, fn [k, v] -> {k, v} end)
+      {:ok, if(kept, do: Map.put_new(stats, "integrity_error", kept), else: stats)}
     end
   end
 
@@ -690,7 +698,7 @@ defmodule Glider do
   """
   @spec revision(db(), keyword()) :: {:ok, non_neg_integer()} | {:error, String.t()}
   def revision(db, opts \\ []) do
-    with {:ok, s} <- stats_bounded(db, opts, "Glider.revision/2"), do: {:ok, s["revision"]}
+    with {:ok, s} <- stats_bounded(db, opts, [], "Glider.revision/2"), do: {:ok, s["revision"]}
   end
 
   @doc """
@@ -702,7 +710,8 @@ defmodule Glider do
   """
   @spec generation(db(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
   def generation(db, opts \\ []) do
-    with {:ok, s} <- stats_bounded(db, opts, "Glider.generation/2"), do: {:ok, s["generation"]}
+    with {:ok, s} <- stats_bounded(db, opts, [], "Glider.generation/2"),
+         do: {:ok, s["generation"]}
   end
 
   @doc """
@@ -738,7 +747,7 @@ defmodule Glider do
     with {:ok, args, budget} <- Glider.Procedure.split(opts, [:changes], "Glider.health/2"),
          probe = [probe: true] ++ budget,
          {:ok, read_error} <- Native.read_error(db),
-         {:ok, stats} <- stats_bounded(db, probe, "Glider.health/2"),
+         {:ok, stats} <- stats_bounded(db, budget, [probe: true], "Glider.health/2"),
          {:ok, installed} <- installed_extensions(db, probe),
          {:ok, changes} <-
            changes_status(db, installed, Keyword.get(args, :changes, true), budget),
@@ -765,11 +774,11 @@ defmodule Glider do
     end
   end
 
-  defp stats_bounded(db, opts, what) do
-    {probe, opts} = Keyword.split(opts, [:probe])
-
+  # `opts` are the caller's (only the budget is allowed); `internal` the
+  # binding's own (`probe: true`), never taken from a caller.
+  defp stats_bounded(db, opts, internal, what) do
     with {:ok, [], budget} <- Glider.Procedure.split(opts, [], what),
-         {:ok, r} <- Glider.Procedure.statement(db, "STATS", [], nil, probe ++ budget) do
+         {:ok, r} <- Glider.Procedure.statement(db, "STATS", [], nil, internal ++ budget) do
       {:ok, Map.new(r.rows, fn [k, v] -> {k, v} end)}
     end
   end

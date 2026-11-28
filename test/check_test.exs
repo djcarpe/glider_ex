@@ -109,11 +109,11 @@ defmodule Glider.CheckTest do
     for i <- 1..20, do: Glider.run!(db, "CREATE (:Loose {i: $i})", i: i)
     opts = [checks: @database ++ ["orphans"]]
     {:ok, whole} = Check.run(db, opts)
-    assert whole.after == nil
+    assert whole.after == nil and whole.complete
 
     reports = db |> Check.stream([limit: 3] ++ opts) |> Enum.to_list()
     assert length(reports) > 3
-    assert Enum.all?(Enum.drop(reports, -1), &is_binary(&1.after))
+    assert Enum.all?(Enum.drop(reports, -1), &(is_binary(&1.after) and not &1.complete))
     assert List.last(reports).after == nil
     assert Enum.flat_map(reports, & &1.findings) == whole.findings
 
