@@ -363,7 +363,14 @@ defmodule GliderTest do
 
       {:ok, dst} = Glider.open()
       assert {:ok, {3, 2}} = Glider.import_jsonl(dst, dump)
-      assert Glider.stats(dst) == Glider.stats(src)
+      # The same graph: the same counts and the same schema. Not the same
+      # revision, generation or sizes, which describe each database's own
+      # history and storage.
+      graph = ~w(nodes edges labels edge_types indexes)
+      {:ok, s_src} = Glider.stats(src)
+      {:ok, s_dst} = Glider.stats(dst)
+      assert Map.take(s_dst, graph) == Map.take(s_src, graph)
+      assert Glider.schema(dst) == Glider.schema(src)
     end
 
     test "malformed jsonl is an error, not a crash" do

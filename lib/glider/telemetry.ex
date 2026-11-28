@@ -36,6 +36,13 @@ defmodule Glider.Telemetry do
   `cluster.kmeans` and the rest — so they are measured and traced like the
   engine's own `CALL`s.
 
+  The typed wrappers over engine procedures (`Glider.Changes`,
+  `Glider.Check`, `Glider.health/2`, `Glider.revision/2`) emit
+  `[:glider, :query, _]` too, with `:procedure` set from the start (the
+  engine procedure, `"changes.since"`, `"check.run"`, ...) and `rows` and
+  `touched` on stop; they run with a statement budget, so their stop does
+  not carry the engine's page counters or `:db_name`.
+
   `:operation` is the statement kind the engine parsed — `"MATCH"`,
   `"CREATE"`, `"CALL"`, ... or `"INVALID"` — and `:procedure` the algorithm a
   `CALL` ran. `:result` is `:ok` or `:error`, and a failed call's `:error` is

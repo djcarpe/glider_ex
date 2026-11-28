@@ -291,8 +291,8 @@ defmodule Glider do
              Keyword.get(opts, :max_rows, 10_000),
              bytes(Keyword.get(opts, :max_bytes, 8 <<< 20)),
              Keyword.get(opts, :graph, false),
-             budget(opts, :max_millis),
-             budget(opts, :max_steps)
+             {budget(opts, :max_millis), budget(opts, :max_steps)},
+             false
            ) do
       {:ok, to_result(result)}
     end
@@ -388,6 +388,9 @@ defmodule Glider do
   Stream JSONL from a server-side file. Keys and ids are remapped on disk.
   `:max_record_bytes` defaults to 1 MiB, bounded by work_mem. Each 1,000-op
   slice commits atomically; an error rolls back the current slice.
+
+  Refused inside `transaction/2` (it commits on its own, which would commit
+  the transaction's pending writes); the refusal aborts the transaction.
   """
   def import_file(db, path, opts \\ []) do
     case Native.import_file(db, path, bytes(Keyword.get(opts, :max_record_bytes, 1 <<< 20))) do
@@ -400,6 +403,9 @@ defmodule Glider do
   Apply one atomic slice of at most 1,000 `{cypher, params}` writes. One native
   call and one commit per slice. Errors roll back the whole slice. Call between
   slices to allow queries through; explicit transaction controls are rejected.
+
+  Refused inside `transaction/2`, where it would commit on its own; the
+  refusal aborts the transaction. Run it before or after.
   """
   def write_batch(db, statements) when is_list(statements) and length(statements) <= 1000 do
     statements = Enum.map(statements, fn {q, params} -> {q, Map.to_list(stringify(params))} end)
@@ -500,6 +506,15 @@ defmodule Glider do
 
   Calling `transaction/2` while the process already holds a transaction on
   `db` runs `fun` inside it.
+
+  Nothing in it commits before it ends: operations that commit on their own
+  (`COMPACT`, `import_jsonl/2`, `import_file/3`, `write_batch/2`) are
+  refused inside it with an error, which aborts it like any other. The
+  imports and the batch were refused before too; `COMPACT` used to run and
+  commit the transaction's pending writes, and is now refused. The
+  engine sees the transaction start (glider's `Graph::begin()`), so one it
+  rolled back itself (a failed write hook, a memory graph past
+  `:max_memory`) cannot commit in part either.
   """
   @spec transaction(db(), (-> result)) :: {:ok, result} | {:error, term()} when result: term()
   def transaction(db, fun) when is_function(fun, 0) do
@@ -578,6 +593,9 @@ defmodule Glider do
 
       {"type":"node","id":1,"labels":["Person"],"props":{"name":"Ada"}}
       {"type":"edge","from":1,"to":2,"label":"KNOWS","props":{}}
+
+  Refused inside `transaction/2` (an import commits on its own); the
+  refusal aborts the transaction.
   """
   @spec import_jsonl(db(), String.t()) ::
           {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, String.t()}
@@ -632,11 +650,16 @@ defmodule Glider do
   end
 
   @doc """
-  Node, edge, label and index counts, as a map. A database opened with
+  Node, edge, label and index counts, as a map, with the database's
+  `"revision"` and `"generation"` (see `revision/2`). A database opened with
   `:hot_size` adds the hot set's counters: `"hot_capacity"`, `"hot_pages"`,
   `"hot_hits"`, `"promotions"`, `"demotions"` and `"prewarmed"` (pages
   loaded at open from the list a previous open left). The page cache's
   traffic is in `Glider.Telemetry.metrics/1`.
+
+  Two databases holding the same graph report the same counts, but not
+  necessarily the same revision, generation or sizes: those describe the
+  history and storage of the one database.
   """
   @spec stats(db()) :: {:ok, map()} | {:error, String.t()}
   def stats(db) do
@@ -644,6 +667,131 @@ defmodule Glider do
       {:ok, Map.new(r.rows, fn [k, v] -> {k, v} end)}
     end
   end
+
+  @doc """
+  The database's revision: a number that grows with every committed
+  transaction that changed something, and with nothing else (not a write
+  that changes nothing, a checkpoint, a reopen or a restore). It is durable,
+  and a replica that has replayed the same transactions reports the same
+  one. Keep it beside anything derived from the graph; if it is the same
+  later, nothing has changed since. `Glider.Changes` says what did.
+
+      {:ok, rev} = Glider.revision(db)
+      {:ok, 1} = Glider.run(db, "CREATE (:Note)")
+      {:ok, later} = Glider.revision(db)
+      true = later > rev
+
+  The number is a log position, not a count, so it grows by more than one
+  a change. With `generation/2` it names one state along one line of
+  history: a copy restored from a replica and then written to is a second
+  line, so a consumer that keys what it keeps by the pair treats a restore
+  as a new source. Cheap: it reads counters the engine keeps, as `stats/1`
+  does. Takes `:max_millis` and `:max_steps` like every procedure wrapper.
+  """
+  @spec revision(db(), keyword()) :: {:ok, non_neg_integer()} | {:error, String.t()}
+  def revision(db, opts \\ []) do
+    with {:ok, s} <- stats_bounded(db, opts, "Glider.revision/2"), do: {:ok, s["revision"]}
+  end
+
+  @doc """
+  The database's lineage: 32 hex digits naming its line of history, kept
+  by replicas and restores (all zeros for a memory graph without a log).
+  See `revision/2`.
+
+      {:ok, "00000000000000000000000000000000"} = Glider.generation(db)
+  """
+  @spec generation(db(), keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  def generation(db, opts \\ []) do
+    with {:ok, s} <- stats_bounded(db, opts, "Glider.generation/2"), do: {:ok, s["generation"]}
+  end
+
+  @doc """
+  One cheap call to run before relying on a graph: its revision and
+  lineage, node and edge counts, memory and file sizes, which extensions
+  are installed, the change journal's status when it is installed (oldest
+  revision it answers for, entries, cap), and whether the engine has
+  recorded a storage read error. Returns a `Glider.Health`.
+
+      {:ok, %Glider.Health{revision: rev, read_error: nil, changes: %Glider.Changes.Status{oldest: oldest}}} =
+        Glider.health(db)
+
+  It runs no scan of the graph: the counts are the engine's own counters.
+  The one thing it reads that grows with the data is the change journal,
+  whose status counts its entries (a few milliseconds for a few hundred
+  thousand; at most its cap); `changes: false` leaves the journal out.
+  `:max_millis` and `:max_steps` are passed to every statement it runs.
+
+  A read error is a page that failed to read (a checksum, a short file).
+  The engine records the first one and the next statement fails with it.
+  `health` reports it in full and leaves it in place, so that statement
+  still fails; run `glider <db> verify`. Inside a transaction it changes
+  nothing: none of its statements writes, and none of their failures
+  aborts the transaction.
+
+  What it does not tell you: whether the graph is whole. Counters can
+  disagree with the records, an edge can point at a node that is gone, and
+  derived data can drift from its graph, all without a read error. That
+  takes a walk over every record: `Glider.Check.run/2`.
+  """
+  @spec health(db(), keyword()) :: {:ok, Glider.Health.t()} | {:error, String.t()}
+  def health(db, opts \\ []) do
+    with {:ok, args, budget} <- Glider.Procedure.split(opts, [:changes], "Glider.health/2"),
+         probe = [probe: true] ++ budget,
+         {:ok, read_error} <- Native.read_error(db),
+         {:ok, stats} <- stats_bounded(db, probe, "Glider.health/2"),
+         {:ok, installed} <- installed_extensions(db, probe),
+         {:ok, changes} <-
+           changes_status(db, installed, Keyword.get(args, :changes, true), budget),
+         {:ok, later} <- Native.read_error(db) do
+      memory =
+        stats["memory_bytes"] ||
+          (stats["cached_pages"] && stats["page_size"] &&
+             stats["cached_pages"] * stats["page_size"])
+
+      {:ok,
+       %Glider.Health{
+         revision: stats["revision"],
+         generation: stats["generation"],
+         nodes: stats["nodes"],
+         edges: stats["edges"],
+         memory_bytes: memory,
+         max_memory: stats["max_memory"],
+         file_bytes: stats["file_bytes"],
+         log_bytes: stats["log_bytes"],
+         extensions: installed,
+         changes: changes,
+         read_error: stats["integrity_error"] || read_error || later
+       }}
+    end
+  end
+
+  defp stats_bounded(db, opts, what) do
+    {probe, opts} = Keyword.split(opts, [:probe])
+
+    with {:ok, [], budget} <- Glider.Procedure.split(opts, [], what),
+         {:ok, r} <- Glider.Procedure.statement(db, "STATS", [], nil, probe ++ budget) do
+      {:ok, Map.new(r.rows, fn [k, v] -> {k, v} end)}
+    end
+  end
+
+  defp installed_extensions(db, opts) do
+    with {:ok, r} <- Glider.Procedure.statement(db, "SHOW EXTENSIONS", [], nil, opts) do
+      {:ok,
+       for(
+         [name, _available, version, _summary] <- r.rows,
+         version != nil,
+         do: %{name: name, version: version}
+       )}
+    end
+  end
+
+  defp changes_status(db, installed, true, budget) do
+    if Enum.any?(installed, &(&1.name == "changes")),
+      do: Glider.Changes.status(db, budget),
+      else: {:ok, nil}
+  end
+
+  defp changes_status(_db, _installed, _skip, _budget), do: {:ok, nil}
 
   @doc """
   Fold the write-ahead log into the database pages and reclaim its space.

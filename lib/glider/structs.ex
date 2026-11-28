@@ -53,3 +53,51 @@ defmodule Glider.Result do
 
   defstruct columns: [], rows: [], graph: %{nodes: [], edges: []}, message: nil, touched: 0
 end
+
+defmodule Glider.Health do
+  @moduledoc """
+  What `Glider.health/2` reports.
+
+    * `revision`, `generation` - the database's revision and lineage
+      (`Glider.revision/2`, `Glider.generation/2`).
+    * `nodes`, `edges` - counts the engine keeps, not a scan.
+    * `memory_bytes` - a memory graph's pages; for a file, the cached pages.
+    * `max_memory` - a memory graph's limit; `nil` for a file.
+    * `file_bytes`, `log_bytes` - the file's size and the log a crash
+      would replay (0 for a memory graph).
+    * `extensions` - the extensions installed in this database, as
+      `%{name: name, version: version}`.
+    * `changes` - the change journal's `Glider.Changes.Status` when it is
+      installed (and not skipped with `changes: false`), else `nil`.
+    * `read_error` - the storage read error the engine has recorded since
+      it was last reported, or `nil`.
+  """
+
+  @type t :: %__MODULE__{
+          revision: non_neg_integer(),
+          generation: String.t(),
+          nodes: non_neg_integer(),
+          edges: non_neg_integer(),
+          memory_bytes: non_neg_integer() | nil,
+          max_memory: non_neg_integer() | nil,
+          file_bytes: non_neg_integer(),
+          log_bytes: non_neg_integer(),
+          extensions: [%{name: String.t(), version: String.t()}],
+          changes: Glider.Changes.Status.t() | nil,
+          read_error: String.t() | nil
+        }
+
+  defstruct [
+    :revision,
+    :generation,
+    :nodes,
+    :edges,
+    :memory_bytes,
+    :max_memory,
+    :file_bytes,
+    :log_bytes,
+    :changes,
+    :read_error,
+    extensions: []
+  ]
+end

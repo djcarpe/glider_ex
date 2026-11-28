@@ -99,6 +99,63 @@ defmodule Glider.TelemetryTest do
     assert name == m.name
   end
 
+  test "the derived-data wrappers are query spans naming their procedure", %{db: db} do
+    Glider.run!(db, "CREATE (:BeforeTheJournal)")
+    :ok = Glider.Changes.install(db)
+    :ok = Glider.Check.install(db)
+    {:ok, rev} = Glider.revision(db)
+
+    {:ok, _} = Glider.Changes.since(db, rev, max_steps: 1_000)
+    assert_receive {:event, [:glider, :query, :start], _, %{db: ^db, procedure: "changes.since"}}
+
+    assert_receive {:event, [:glider, :query, :stop], m,
+                    %{db: ^db, procedure: "changes.since"} = meta}
+
+    assert meta.operation == "CALL" and meta.result == :ok and m.rows == 0
+    assert meta.query =~ "CALL changes.since(revision: $revision)"
+
+    {:error, %Glider.Changes.Unanswerable{}} = Glider.Changes.since(db, 0)
+
+    assert_receive {:event, [:glider, :query, :stop], _,
+                    %{db: ^db, procedure: "changes.since", result: :error}}
+
+    for {fun, procedure} <- [
+          {fn -> Glider.Changes.status(db) end, "changes.status"},
+          {fn -> Glider.Changes.release(db, rev) end, "changes.release"},
+          {fn -> Glider.Changes.cap(db, 1_000) end, "changes.cap"},
+          {fn -> Glider.Check.run(db) end, "check.run"}
+        ] do
+      {:ok, _} = fun.()
+
+      assert_receive {:event, [:glider, :query, :stop], _,
+                      %{db: ^db, procedure: ^procedure, result: :ok}}
+    end
+
+    {:ok, _} = Glider.health(db)
+
+    assert_receive {:event, [:glider, :query, :stop], _,
+                    %{db: ^db, query: "STATS", operation: "STATS"}}
+
+    assert_receive {:event, [:glider, :query, :stop], _, %{db: ^db, query: "SHOW EXTENSIONS"}}
+    assert_receive {:event, [:glider, :query, :stop], _, %{db: ^db, procedure: "changes.status"}}
+  end
+
+  test "the wrappers' statement budget reaches the engine", %{db: db} do
+    # The same path every wrapper takes, on a statement this engine already
+    # stops: a procedure stops the same way from the engine version whose
+    # procedures count steps.
+    for i <- 1..300, do: Glider.run!(db, "CREATE (:N {i: $i})", i: i)
+    heavy = "MATCH (a:N), (b:N) WHERE a.i = b.i + 100000 RETURN count(*)"
+
+    assert {:error, "statement stopped: " <> _} =
+             Glider.Procedure.statement(db, heavy, [], nil, max_steps: 100)
+
+    assert_receive {:event, [:glider, :query, :stop], _,
+                    %{db: ^db, query: ^heavy, result: :error}}
+
+    assert {:ok, %{rows: []}} = Glider.Procedure.statement(db, heavy, [], nil, [])
+  end
+
   describe "OpenTelemetry" do
     setup do
       :otel_simple_processor.set_exporter(:otel_exporter_pid, self())
