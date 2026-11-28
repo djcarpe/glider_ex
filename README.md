@@ -52,7 +52,11 @@ mix test
 | `Glider.extensions/1`, `create_extension/2`, `drop_extension/2` | engine extensions this build has and this database installed |
 | `Glider.expand/3` | neighbours of one node, both directions |
 | `Glider.import_jsonl/2`, `Glider.export_jsonl/1` | bulk load and dump |
-| `Glider.stats/1` | node, edge, label and index counts |
+| `Glider.stats/1` | node, edge, label and index counts, with the revision and generation |
+| `Glider.revision/2`, `Glider.generation/2` | has the graph changed since I last looked: its revision and lineage |
+| `Glider.health/2` | one cheap call before relying on a graph: revision, counts, memory, extensions, the change journal, read errors |
+| `Glider.Changes` | what changed since a revision: `install/2`, `since/3`, `stream/3`, `status/2`, `release/3`, `cap/3` |
+| `Glider.Check` | is the graph whole: `install/1`, `run/2`, `stream/2` |
 | `Glider.checkpoint/1` | fold the write-ahead log into the pages |
 | `Glider.poll_replication/1` | serve a replicator's request on an idle handle |
 | `Glider.close/1` | release the graph and its file lock |
@@ -147,6 +151,76 @@ The functions work in queries too: `RETURN context.card(p)`, and
 passed as parameters and checked against the procedure's; see glider's
 `docs/EXTENSIONS.md` for all of them.
 
+## Derived data: revision, changes, checks, health
+
+Things kept beside a graph and computed from it (embeddings that cost money,
+summaries, compiled text for a model) are kept right by jobs that ask three
+questions: has the graph changed since I last looked, what exactly changed,
+and is the graph whole.
+
+```elixir
+# has it changed? the revision grows with every committed change, and only then
+{:ok, rev} = Glider.revision(db)
+
+# what changed? the change journal, installed once
+:ok = Glider.Changes.install(db, cap: 1_000_000)
+
+case Glider.Changes.since(db, kept_revision) do
+  {:ok, %Glider.Changes.Slice{changes: changes, after: nil, complete_up_to: now}} ->
+    reembed(for %{kind: :node, change: :put, id: id} <- changes, do: id)
+    keep(now)
+
+  {:ok, %Glider.Changes.Slice{after: cursor}} ->
+    # more than one slice: call again with after: cursor, or use stream/3
+
+  {:error, %Glider.Changes.Unanswerable{oldest: oldest}} ->
+    # the journal cannot say (installed later, released, capped, CLEAR):
+    # rebuild from a scan, then carry on from `oldest` or later
+    rebuild_all()
+end
+
+# large answers, a slice at a time, with the handle free in between
+db |> Glider.Changes.stream(kept_revision) |> Stream.chunk_every(100) |> Enum.each(&reembed/1)
+
+# is it whole? edges, adjacency, membership, counters, indexes, derived data
+:ok = Glider.Check.install(db)
+{:ok, %Glider.Check.Report{findings: []}} = Glider.Check.run(db)
+db |> Glider.Check.stream(limit: 100_000) |> Stream.flat_map(& &1.findings) |> Enum.to_list()
+
+# before relying on it at all
+{:ok, %Glider.Health{revision: rev, read_error: nil, changes: journal}} = Glider.health(db)
+```
+
+`Glider.Changes.since/3` and `stream/3` are refused inside a transaction
+(`{:error, %Glider.Changes.InTransaction{}}`), where the journal would list
+the transaction's own pending writes; a `complete_up_to` they hand back is
+always a committed revision.
+
+The journal never answers "nothing changed" when it cannot answer: asked
+about a revision it no longer (or never) covers, `since/3` returns
+`{:error, %Glider.Changes.Unanswerable{}}` with the oldest revision it does
+cover, and `stream/3` raises it on first use. An empty list of changes always
+means nothing changed.
+
+`Glider.Check.run/2` reports and never repairs. With no `:checks` it runs the
+six checks of the database (findings of severity `:fault`); `:duplicates`,
+`:orphans` and `:required` are facts about the data (`:candidate`) and run
+only when named. Each finding names the record (`"e2"`, `"n12"`, or the
+label, index or counter at fault).
+
+`Glider.health/2` runs no scan of the graph (the change journal's status
+counts its own entries; `changes: false` leaves it out) and so cannot say
+whether the graph is whole: that is `Glider.Check.run/2`. It reports a
+storage read error the engine has recorded and not yet reported, in full,
+and leaves it for the next statement to fail with; inside a transaction it
+changes nothing.
+
+Every one of these takes `:max_millis` and `:max_steps` and passes them to
+the engine; procedures obey them from the engine version whose procedures
+count steps. Each is a `[:glider, :query, ...]` span with `:procedure` set
+(`"changes.since"`, `"check.run"`, ...). See glider's `docs/DERIVED.md` and
+`docs/EXTENSIONS.md` for what the engine guarantees.
+
 ## Transactions
 
 ```elixir
@@ -164,6 +238,13 @@ transaction is rolled back for it. An exception rolls back and re-raises; a
 statement that fails inside the transaction aborts it, and it returns
 `{:error, reason}` without committing. A nested `transaction/2` joins the
 outer one.
+
+The transaction is one the engine can see start and end (glider's
+`Graph::begin()`): if the engine rolls it back itself (a failed write or
+write hook, a memory graph past `max_memory`) nothing more can go into it or
+commit from it, and operations that commit on their own (`COMPACT`,
+`import_jsonl/2`, `import_file/3`, `write_batch/2`) are refused inside it
+rather than committing its pending writes.
 
 `BEGIN`, `COMMIT` and `ROLLBACK` sent as statement text are refused, from
 every function that takes a statement: as text they would open or close the
@@ -290,6 +371,21 @@ up to `:log_cap` (64M by default); past it the next pass takes a new base.
 A memory graph opened without `log: true` keeps no log and cannot be
 replicated, and pays nothing for it.
 
+## Upgrading
+
+Notes for code written against earlier versions of this binding:
+
+- `COMPACT` inside `Glider.transaction/2` is now refused, and the refusal
+  aborts the transaction. It used to run and commit the transaction's
+  pending writes, so a rollback afterwards undid nothing. Run it outside a
+  transaction. (`import_jsonl/2`, `import_file/3` and `write_batch/2` were
+  already refused inside one; they now say why.)
+- A process killed while it waits to begin a transaction no longer leaves
+  the handle owned by a dead process: it takes nothing, and the next
+  waiter gets the handle.
+- `Glider.stats/1` carries `"revision"` and `"generation"`: two databases
+  with the same graph no longer compare equal as whole maps.
+
 ## Writing queries in Elixir source
 
 Use a plain string, or a heredoc sigil. **Do not use the bracket sigils**:
@@ -360,7 +456,10 @@ write code against this library:
 ```
 lib/glider.ex              public API
 lib/glider/query.ex        Glider.Query, the composable query builder
-lib/glider/structs.ex      %Glider.Node{}, %Glider.Rel{}, %Glider.Result{}
+lib/glider/structs.ex      %Glider.Node{}, %Glider.Rel{}, %Glider.Result{}, %Glider.Health{}
+lib/glider/changes.ex      Glider.Changes, the change journal (structs in changes/)
+lib/glider/check.ex        Glider.Check, integrity checks (structs in check/)
+lib/glider/procedure.ex    running an engine procedure for a wrapper (private)
 lib/glider/telemetry.ex    events, engine metrics, the native OTLP exporter
 lib/glider/open_telemetry.ex  OpenTelemetry spans from the events
 lib/glider/replication.ex  Glider.Replication: S3/dir replication and restore

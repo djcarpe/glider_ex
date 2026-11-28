@@ -14,8 +14,12 @@ defmodule Glider.Native do
   def migrate(_path), do: err()
   def query(_db, _q, _params), do: err()
 
-  def query_bounded(_db, _q, _params, _max_rows, _max_bytes, _projection, _millis, _steps),
+  # `{millis, steps}`: the statement budget; `probe`: a statement that
+  # writes nothing and whose failure does not abort the caller's transaction.
+  def query_bounded(_db, _q, _params, _max_rows, _max_bytes, _projection, _millis_steps, _probe),
     do: err()
+
+  def read_error(_db), do: err()
 
   def cursor_open(_db, _q, _params, _max_rows, _max_bytes, _millis, _steps), do: err()
   def cursor_next(_cursor), do: err()
@@ -44,7 +48,10 @@ defmodule Glider.Native do
   def memory_replication_sync(_db, _url, _opts, _force_snapshot, _enforce_retention), do: err()
   def memory_replication_lag(_db, _url, _opts), do: err()
   def memory_replication_enforce_retention(_db, _url, _opts), do: err()
-  def memory_replication_restore(_url, _generation, _as_of, _max_bytes, _log_cap, _opts), do: err()
+
+  def memory_replication_restore(_url, _generation, _as_of, _max_bytes, _log_cap, _opts),
+    do: err()
+
   def close(_db), do: err()
   def version, do: err()
   def telemetry_snapshot, do: err()

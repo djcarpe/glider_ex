@@ -21,7 +21,12 @@
 //!    process as the owner; calls from any other process wait until it
 //!    commits or rolls back, so nobody sees or joins half a transaction. The
 //!    owner is monitored: if it dies mid-transaction, the transaction is
-//!    rolled back and the handle freed.
+//!    rolled back and the handle freed. It is opened with the engine's
+//!    `Graph::begin()`, so the engine can see it start and end: an operation
+//!    that commits on its own (`COMPACT`, an import, a batch) is refused
+//!    inside it instead of committing its pending writes, and a block the
+//!    engine rolled back (a failed write or hook, a full memory graph) is
+//!    spent until it ends, so no part of it can commit.
 //!
 //! Results are built as native Erlang terms rather than JSON. Every fallible
 //! NIF returns `Result<_, String>`, which rustler encodes as `{:ok, _}` or
@@ -84,6 +89,11 @@ pub struct DbResource {
     /// endpoint), kept with the handle: what each has learned of its backend
     /// outlives a pass, so only the first pass to a replica looks first.
     replicators: Mutex<HashMap<String, Arc<Mutex<MemoryReplicator>>>>,
+    /// A storage read error taken from the engine by `read_error/1`, which
+    /// reads it without clearing it: the engine's record is taken when read,
+    /// so it is kept here and reported by the next statement instead, as
+    /// the engine would have (see `report_damage`).
+    damage: Mutex<Option<String>>,
 }
 
 struct State {
@@ -103,8 +113,8 @@ impl Resource for DbResource {
         let mut st = self.lock();
         if st.owner.as_ref().map(|(p, _)| *p == pid).unwrap_or(false) {
             if let Some(g) = st.graph.as_mut() {
+                // Ends the `begin()` block too.
                 let _ = g.rollback();
-                g.autocommit = true;
             }
             st.owner = None;
             st.aborted = false;
@@ -167,6 +177,51 @@ impl DbResource {
         }
         r
     }
+
+    /// `with` for a statement that writes nothing (`Glider.health/2`'s): its
+    /// failure does not abort the caller's transaction, since nothing of the
+    /// transaction was touched (the engine rolls back a block only on a
+    /// failed write).
+    fn with_probe<T>(
+        &self,
+        caller: LocalPid,
+        f: impl FnOnce(&mut Graph) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut st = self.acquire(caller)?;
+        if st.owner.is_some() && st.aborted {
+            return Err("the transaction was aborted by an earlier error; roll it back".into());
+        }
+        match st.graph.as_mut() {
+            Some(g) => f(g),
+            None => Err("this graph is closed".to_string()),
+        }
+    }
+
+    fn damage(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.damage.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Report a read error kept by `read_error/1`, once, as the engine
+    /// reports its own: the statement fails instead of running. `STATS`
+    /// is the one statement the engine lets through with a read error
+    /// pending, and so is this.
+    fn report_damage(&self, src: Option<&str>) -> Result<(), String> {
+        if src.is_some_and(|q| q.trim().eq_ignore_ascii_case("stats")) {
+            return Ok(());
+        }
+        match self.damage().take() {
+            Some(e) => Err(damaged(&e)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The engine's words for a statement that met a read error.
+fn damaged(e: &str) -> String {
+    format!(
+        "database image is damaged: {e}. Run `glider <db> verify`; \
+         restore from a replica if it confirms the damage"
+    )
 }
 
 fn new_handle(graph: Graph) -> ResourceArc<DbResource> {
@@ -178,6 +233,7 @@ fn new_handle(graph: Graph) -> ResourceArc<DbResource> {
         }),
         free: Condvar::new(),
         replicators: Mutex::new(HashMap::new()),
+        damage: Mutex::new(None),
     })
 }
 
@@ -648,11 +704,12 @@ fn query_bounded<'a>(
     max_rows: usize,
     max_bytes: u64,
     projection: bool,
-    max_millis: u64,
-    max_steps: u64,
+    millis_steps: (u64, u64),
+    probe: bool,
 ) -> Result<Term<'a>, String> {
     let q = source_of(q)?;
-    db.with(env.pid(), |g| {
+    let (max_millis, max_steps) = millis_steps;
+    let run = |g: &mut Graph| {
         let _lease = workspace(g)?;
         let params = params_of(params, &mut (g.query_memory() / 8))?;
         let limits = query::QueryLimits {
@@ -663,7 +720,29 @@ fn query_bounded<'a>(
         };
         let r = query::execute_capped(g, &q, &params, limits).map_err(|e| e.to_string())?;
         result_term(env, g, &r, projection, limits.max_bytes)
-    })
+    };
+    if probe {
+        // A probe leaves a read error where it finds it: one the engine
+        // recorded is moved here first, so the statement cannot take it.
+        db.with_probe(env.pid(), |g| {
+            if let Some(e) = g.integrity_error() {
+                db.damage().get_or_insert(e);
+            }
+            // One the statement met itself, the engine reported and cleared:
+            // kept here too, so the next statement still reports it.
+            run(g).inspect_err(|e| {
+                if let Some(inner) = e.strip_prefix("database image is damaged: ") {
+                    let inner = inner.split(". Run `glider <db> verify`").next().unwrap_or(inner);
+                    db.damage().get_or_insert(inner.to_string());
+                }
+            })
+        })
+    } else {
+        db.with(env.pid(), |g| {
+            db.report_damage(Some(q))?;
+            run(g)
+        })
+    }
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -679,6 +758,7 @@ fn cursor_open(
 ) -> Result<ResourceArc<CursorResource>, String> {
     let q = source_of(q)?;
     let cursor = db.with(env.pid(), |g| {
+        db.report_damage(Some(q))?;
         let _lease = workspace(g)?;
         let params = params_of(params, &mut (g.query_memory() / 8))?;
         query::Cursor::open(
@@ -751,6 +831,7 @@ fn cursor_close(cursor: ResourceArc<CursorResource>) -> Atom {
 #[rustler::nif(schedule = "DirtyIo")]
 fn export_file(env: Env, db: ResourceArc<DbResource>, path: String) -> Result<Atom, String> {
     db.with(env.pid(), |g| {
+        db.report_damage(None)?;
         let _lease = workspace(g)?;
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -772,6 +853,7 @@ fn import_file(
     max_record_bytes: u64,
 ) -> Result<(usize, usize), String> {
     db.with(env.pid(), |g| {
+        db.report_damage(None)?;
         let _lease = workspace(g)?;
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
         query::import_jsonl_from(
@@ -786,6 +868,7 @@ fn import_file(
 #[rustler::nif(schedule = "DirtyIo")]
 fn write_batch(env: Env, db: ResourceArc<DbResource>, statements: Term) -> Result<usize, String> {
     db.with(env.pid(), |g| {
+        db.report_damage(None)?;
         let _lease = workspace(g)?;
         let items: rustler::types::list::ListIterator =
             statements.decode().map_err(|_| "bad write slice")?;
@@ -906,6 +989,7 @@ fn query<'a>(
     let mut ran = None;
     let out = db.with(env.pid(), |g| {
         ran = Some(g.telemetry_name());
+        db.report_damage(Some(q))?;
         let _lease = workspace(g)?;
         let params = params_of(params, &mut (g.query_memory() / 8))?;
         let limits = query::QueryLimits {
@@ -1052,6 +1136,7 @@ fn import_jsonl(
     jsonl: Binary,
 ) -> Result<(usize, usize), String> {
     db.with(env.pid(), |g| {
+        db.report_damage(None)?;
         let _lease = workspace(g)?;
         if jsonl.len() as u64 > g.query_memory() / 8 {
             return Err("import exceeds work_mem; use import_file".into());
@@ -1068,6 +1153,7 @@ fn import_jsonl(
 #[rustler::nif(schedule = "DirtyCpu")]
 fn export_jsonl(env: Env, db: ResourceArc<DbResource>) -> Result<String, String> {
     db.with(env.pid(), |g| {
+        db.report_damage(None)?;
         let _lease = workspace(g)?;
         let mut writer = LimitedWriter {
             bytes: Vec::new(),
@@ -1090,6 +1176,26 @@ fn checkpoint(env: Env, db: ResourceArc<DbResource>) -> Result<Atom, String> {
     Ok(atoms::ok())
 }
 
+/// The storage read error the engine has recorded and not yet reported,
+/// read without clearing it and without touching any transaction (it waits
+/// only for a statement running now, not for another process's
+/// transaction). The engine's own record is taken when read, so it is kept
+/// on the handle, and the next statement reports it as the engine would
+/// have. A native function because reading it through a statement is what
+/// clears it.
+#[rustler::nif(schedule = "DirtyIo")]
+fn read_error(db: ResourceArc<DbResource>) -> Result<Option<String>, String> {
+    let mut st = db.lock();
+    let Some(g) = st.graph.as_mut() else {
+        return Err("this graph is closed".into());
+    };
+    let mut kept = db.damage();
+    if let Some(e) = g.integrity_error() {
+        kept.get_or_insert(e);
+    }
+    Ok(kept.clone())
+}
+
 /// Start a transaction owned by the calling process.
 #[rustler::nif(schedule = "DirtyIo")]
 fn begin(env: Env, db: ResourceArc<DbResource>) -> Result<Atom, String> {
@@ -1098,12 +1204,25 @@ fn begin(env: Env, db: ResourceArc<DbResource>) -> Result<Atom, String> {
     if st.owner.is_some() {
         return Err("a transaction is already open in this process".into());
     }
-    let Some(g) = st.graph.as_mut() else {
+    if st.graph.is_none() {
         return Err("this graph is closed".into());
+    }
+    // Ownership is tied to a live process before anything is opened. A
+    // caller killed while it waited above is already exiting: it cannot be
+    // monitored, so `down` would never free the handle. Such a caller takes
+    // nothing, and the handle goes to the next waiter. (A caller that dies
+    // after this point is monitored: `down` waits for the lock and rolls
+    // back.)
+    let Some(mon) = env.monitor(&db, &caller) else {
+        return Err("the calling process is not alive; no transaction was opened".into());
     };
-    g.autocommit = false;
-    let mon = env.monitor(&db, &caller);
-    st.owner = Some((caller, mon));
+    let g = st.graph.as_mut().expect("checked above");
+    // A block the engine can see, not `autocommit = false`: see the header.
+    if let Err(e) = g.begin() {
+        env.demonitor(&db, &mon);
+        return Err(e.to_string());
+    }
+    st.owner = Some((caller, Some(mon)));
     st.aborted = false;
     Ok(atoms::ok())
 }
@@ -1117,13 +1236,12 @@ fn end_tx(env: Env, db: &ResourceArc<DbResource>, commit: bool) -> Result<Atom, 
     let aborted = st.aborted;
     let r = match st.graph.as_mut() {
         Some(g) => {
-            let r = if commit && !aborted {
+            // Either ends the `begin()` block and puts autocommit back.
+            if commit && !aborted {
                 g.commit().map_err(|e| e.to_string())
             } else {
                 g.rollback().map_err(|e| e.to_string())
-            };
-            g.autocommit = true;
-            r
+            }
         }
         None => Ok(()),
     };
