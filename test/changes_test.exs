@@ -67,7 +67,9 @@ defmodule Glider.ChangesTest do
     test "lists exactly what changed, by kind then id, with what happened last" do
       db = journaled()
       {:ok, rev} = Glider.revision(db)
-      assert {:ok, %Slice{changes: [], after: nil, complete_up_to: ^rev}} = Changes.since(db, rev)
+
+      assert {:ok, %Slice{changes: [], complete: true, after: nil, complete_up_to: ^rev}} =
+               Changes.since(db, rev)
 
       Glider.run!(db, "CREATE (:A {k: 1})-[:R]->(:B {k: 2})")
       Glider.run!(db, "MATCH (b:Before) DELETE b")
@@ -168,13 +170,10 @@ defmodule Glider.ChangesTest do
 
       result = Changes.since(db, 0)
 
-      assert {:error,
-              %Unanswerable{revision: 0, oldest: ^oldest, reason: :below_oldest, why: :installed} =
-                e} =
+      assert {:error, %Unanswerable{revision: 0, oldest: ^oldest, reason: :installed} = e} =
                result
 
-      assert e.message =~ "cannot answer for revision 0"
-      assert Exception.message(e) =~ "#{oldest}"
+      assert Exception.message(e) =~ "revision #{oldest} and later"
       # the shapes a caller writes for "nothing changed" do not match it
       refute match?({:ok, _}, result)
       refute match?({:ok, %Slice{changes: []}}, result)
@@ -187,7 +186,7 @@ defmodule Glider.ChangesTest do
       db = journaled()
       stream = Changes.stream(db, 0)
       e = assert_raise Unanswerable, fn -> Enum.to_list(stream) end
-      assert e.reason == :below_oldest and is_integer(e.oldest)
+      assert e.reason == :installed and is_integer(e.oldest)
       assert_raise Unanswerable, fn -> Enum.count(stream) end
       assert_raise Unanswerable, fn -> Enum.take(stream, 1) end
     end
@@ -200,7 +199,7 @@ defmodule Glider.ChangesTest do
       Glider.run!(db, "CREATE (:B)")
 
       assert {:ok, %{released: 1, more: false}} = Changes.release(db, r2)
-      assert {:error, %Unanswerable{oldest: ^r2, why: :released}} = Changes.since(db, r1)
+      assert {:error, %Unanswerable{oldest: ^r2, reason: :released}} = Changes.since(db, r1)
       assert {:ok, %Slice{changes: [%Change{kind: :node}]}} = Changes.since(db, r2)
     end
 
@@ -210,7 +209,7 @@ defmodule Glider.ChangesTest do
       {:ok, rev} = Glider.revision(db)
       for i <- 1..200, do: Glider.run!(db, "CREATE (:N {i: $i})", i: i)
 
-      assert {:error, %Unanswerable{reason: :below_oldest, why: :cap, oldest: oldest}} =
+      assert {:error, %Unanswerable{reason: :cap, oldest: oldest}} =
                Changes.since(db, rev)
 
       assert oldest > rev
@@ -222,7 +221,7 @@ defmodule Glider.ChangesTest do
       db = journaled()
       {:ok, rev} = Glider.revision(db)
       Glider.run!(db, "CLEAR")
-      assert {:error, %Unanswerable{why: :cleared}} = Changes.since(db, rev)
+      assert {:error, %Unanswerable{reason: :cleared}} = Changes.since(db, rev)
 
       {:ok, now} = Glider.revision(db)
 

@@ -18,15 +18,15 @@ defmodule Glider.Changes do
 
       # later: what changed since then
       case Glider.Changes.since(db, rev) do
-        {:ok, %Glider.Changes.Slice{changes: changes, after: nil, complete_up_to: now}} ->
+        {:ok, %Glider.Changes.Slice{complete: true, changes: changes, complete_up_to: now}} ->
           recompute(changes)
           keep(now)
 
-        {:ok, %Glider.Changes.Slice{after: cursor}} ->
-          # more than one slice: call again with after: cursor,
+        {:ok, %Glider.Changes.Slice{complete: false, after: cursor}} ->
+          # more than one slice: call again with after: cursor (as given),
           # or use stream/3, which does that for you
 
-        {:error, %Glider.Changes.Unanswerable{oldest: oldest}} ->
+        {:error, %Glider.Changes.Unanswerable{reason: reason, oldest: oldest}} ->
           # the journal cannot say: rebuild from a scan of the graph,
           # then carry on from `oldest` or later
           rebuild_everything()
@@ -37,15 +37,32 @@ defmodule Glider.Changes do
   exists, with what the graph holds now; `:drop`: it is gone) and at what
   revision. Old values are not kept: the graph has the current ones.
 
+  ## Answers in slices, read as data
+
+  `since/3` reads everything about a slice from the row the engine ends
+  every such answer with (glider's `docs/EXTENSIONS.md`, "Answers in
+  slices"): whether it could answer, whether the slice is the last, the one
+  cursor to continue from, the watermark the answer is complete up to and
+  the oldest revision the journal answers for. Nothing is read from the
+  engine's message. A cursor is opaque: pass it back as given.
+
   ## When it cannot answer
 
   The journal is bounded: its cap forgets the oldest entries, `release/3`
   forgets entries at or below a revision, and it knows nothing from before
   it was installed or before a `CLEAR`. Asked about a revision it cannot
   answer for, `since/3` returns `{:error, %Glider.Changes.Unanswerable{}}`
-  carrying the oldest revision it does answer for, and `stream/3` raises the
-  same struct when it is first run. Neither ever gives an empty list for it:
-  an empty list of changes always means nothing changed.
+  with the engine's reason and, where there is one, the oldest revision it
+  does answer for; `stream/3` raises the same struct from whichever slice
+  meets it. Neither ever gives an empty list for it: an empty list of
+  changes always means nothing changed.
+
+  ## Inside a transaction
+
+  `since/3` and `stream/3` answer about committed changes only: the
+  transaction's pending writes are not listed, the watermark is the
+  committed revision, and a question that cannot be answered does not
+  abort the transaction (see `since/3`).
 
   ## Budgets
 
@@ -59,7 +76,7 @@ defmodule Glider.Changes do
   naming the engine procedure (`"changes.since"`, ...).
   """
 
-  alias Glider.Changes.{Change, InTransaction, Slice, Status, Unanswerable}
+  alias Glider.Changes.{Change, Slice, Status, Unanswerable}
   alias Glider.Procedure
 
   @max_rows 10_000
@@ -126,91 +143,100 @@ defmodule Glider.Changes do
 
     * `:kinds` - only these kinds: a list of `:node`, `:edge`, `:adjacency`.
     * `:limit` - the most changes in this slice (at most and by default
-      10,000).
-    * `:after` - carry on after this position: the `after` of the previous
-      slice, with the same `revision` and `:kinds`.
+      9,999).
+    * `:after` - carry on from the `after` of the previous slice, passed
+      back exactly as given, with the same `revision` and `:kinds`.
     * `:max_millis`, `:max_steps` - the statement budget.
 
   Changes come by kind (node, edge, adjacency), then id, each id once per
-  kind with its latest change. A slice with `after: nil` is the last, and
-  its `complete_up_to` is the committed revision it is complete up to,
-  never more than `Glider.revision/2` says (the binding checks it); keep
-  it and ask from it next time. Otherwise call again with
-  `after: slice.after`.
+  kind with its latest change. Everything about the slice is read from the
+  engine's end row: `complete` says whether it ends the answer, `after` is
+  the cursor for the next one (an opaque value, never read or built here),
+  and `complete_up_to` is the committed revision the whole answer is
+  complete up to. Keep the last slice's `complete_up_to` and ask from it
+  next time.
 
-  Refused inside a transaction, with
-  `{:error, %Glider.Changes.InTransaction{}}`, before anything reaches the
-  engine and without touching the transaction: there the journal would
-  list the transaction's own pending writes and a position that may never
-  be committed. Another process's call waits for an open transaction to
-  end, as every call does, and then answers about what was committed.
-
-      {:ok, %Glider.Changes.Slice{changes: [%Glider.Changes.Change{kind: :node, id: 7, change: :put}]}} =
+      {:ok, %Glider.Changes.Slice{complete: true, changes: [%Glider.Changes.Change{kind: :node, id: 7, change: :put}]}} =
         Glider.Changes.since(db, rev)
 
-  Read `revision` at commit boundaries (outside a transaction): the
-  revision a journal entry carries lies between the revision before its
-  transaction and the one it committed at.
+  ## Inside a transaction
 
-  When the journal cannot answer for `revision`, the result is
-  `{:error, %Glider.Changes.Unanswerable{}}` (see the moduledoc); any other
-  failure (the journal not installed, a bad argument) is
-  `{:error, reason}` with a string. Options are checked before anything
-  is sent.
+  It may be called inside a transaction, and answers there about committed
+  changes only, as if the transaction were not open: the transaction's own
+  pending writes are not listed, `complete_up_to` is the committed
+  revision (never a position the transaction may roll back), and a
+  revision past the committed one is `:ahead`. What the transaction writes
+  is listed by the next question from that watermark once it commits, and
+  never if it rolls back. Nothing it does writes, and neither a question
+  it cannot answer nor a refused argument aborts the caller's transaction.
+
+  Read `revision` at commit boundaries: the revision a journal entry
+  carries lies between the revision before its transaction and the one it
+  committed at.
+
+  When the journal cannot answer for `revision` (or, continuing, for the
+  cursor), the result is `{:error, %Glider.Changes.Unanswerable{}}` with
+  the engine's reason and the oldest revision it answers for. Any other
+  failure (the extension not installed, a bad argument, a cursor from
+  another question or database) is `{:error, reason}` with a string.
+  Options are checked before anything is sent.
   """
   @spec since(Glider.db(), non_neg_integer(), keyword()) ::
-          {:ok, Slice.t()} | {:error, Unanswerable.t() | InTransaction.t() | String.t()}
+          {:ok, Slice.t()} | {:error, Unanswerable.t() | String.t()}
   def since(db, revision, opts \\ []) when is_integer(revision) and revision >= 0 do
     with {:ok, args, budget} <-
            Procedure.split(opts, [:kinds, :limit, :after], "Glider.Changes.since/3"),
          :ok <- Procedure.positive(Keyword.get(args, :limit), "limit:"),
-         :ok <- outside_transaction(db) do
-      args = [revision: revision] ++ args
-      max_rows = min(Keyword.get(args, :limit) || @max_rows, @max_rows)
-
-      case Procedure.call(db, "changes.since", args, [max_rows: max_rows] ++ budget) do
-        {:ok, r} -> committed(db, slice(r), budget)
-        {:error, reason} -> {:error, unanswerable(db, revision, reason, budget)}
-      end
+         {:ok, a} <-
+           Procedure.sliced(
+             db,
+             "changes.since",
+             [revision: revision] ++ args,
+             [max_rows: @max_rows, probe: true] ++ budget
+           ) do
+      answer(a, revision)
     end
   end
 
-  defp outside_transaction(db) do
-    if Glider.in_transaction?(db), do: {:error, %InTransaction{}}, else: :ok
+  defp answer(%{end: %{answered: false} = e, message: message}, revision) do
+    {:error,
+     %Unanswerable{revision: revision, reason: e.reason, oldest: e.oldest, message: message}}
   end
 
-  # A watermark handed to a caller is a committed revision: checked against
-  # the revision, which only grows, read after the answer.
-  defp committed(_db, %Slice{complete_up_to: nil} = slice, _budget), do: {:ok, slice}
+  defp answer(%{rows: rows, end: e}, _revision) do
+    changes =
+      Enum.map(rows, fn [rev, kind, id, change] ->
+        %Change{revision: rev, kind: kind(kind), id: id, change: change(change)}
+      end)
 
-  defp committed(db, %Slice{complete_up_to: up_to} = slice, budget) do
-    case Glider.revision(db, budget) do
-      {:ok, rev} when up_to <= rev ->
-        {:ok, slice}
-
-      {:ok, rev} ->
-        {:error,
-         "changes.since said it was complete up to #{up_to}, past the committed revision #{rev}; " <>
-           "nothing is returned, since that position may never be committed"}
-
-      {:error, _} = error ->
-        error
-    end
+    {:ok,
+     %Slice{
+       changes: changes,
+       complete: e.complete,
+       after: if(e.complete, do: nil, else: e.next),
+       complete_up_to: e.watermark
+     }}
   end
 
   @doc """
   The changes after `revision` as a stream of `Glider.Changes.Change`,
-  fetched a slice at a time (`:limit` changes a slice, default 10,000) only
-  as the stream is consumed. The handle is free between slices, so writes
-  can land in between; a change written meanwhile is listed if its position
-  comes after the stream's (its kind and id), and is always listed by the
-  next `since/3` from the revision read before the stream started.
+  fetched a slice at a time (`:limit` changes a slice) only as the stream
+  is consumed. Each slice continues from the cursor the previous one's end
+  row gave, passed back as given, and the stream ends on the slice that
+  says it is complete. The handle is free between slices.
+
+  The cursor carries the first slice's watermark, so a change committed
+  between two slices to an id already passed is not lost: it is listed by
+  the next `since/3` from the watermark (`since/3` with `limit:` gives you
+  the last slice's `complete_up_to`; with the stream, read
+  `Glider.revision/2` before it starts and ask from that).
 
   Takes the options of `since/3` except `:after`. Raises
-  `Glider.Changes.Unanswerable` when the journal cannot answer for
-  `revision`, from the first slice on (so on the first `Enum` call, never
-  as an empty stream), `Glider.Changes.InTransaction` when consumed inside
-  a transaction, and `Glider.Error` on any other failure.
+  `Glider.Changes.Unanswerable` when the journal cannot answer, whether on
+  the first slice or on a later one (a `release/3` or the cap between two
+  slices), never ending as if the answer were complete; and
+  `Glider.Error` on any other failure. Inside a transaction it answers as
+  `since/3` does.
 
       db
       |> Glider.Changes.stream(rev, kinds: [:node])
@@ -225,22 +251,36 @@ defmodule Glider.Changes do
       raise ArgumentError, "Glider.Changes.stream/3 takes no :after; it pages itself"
     end
 
-    Stream.resource(
-      fn -> {:next, nil} end,
-      fn
-        :done ->
-          {:halt, :done}
+    with {:error, reason} <-
+           Procedure.split(opts, [:kinds, :limit], "Glider.Changes.stream/3"),
+         do: raise(ArgumentError, reason)
 
-        {:next, cursor} ->
-          case since(db, revision, Keyword.put(opts, :after, cursor)) do
-            {:ok, %Slice{changes: changes, after: nil}} -> {changes, :done}
-            {:ok, %Slice{changes: changes, after: next}} -> {changes, {:next, next}}
-            {:error, %Unanswerable{} = e} -> raise e
-            {:error, %InTransaction{} = e} -> raise e
-            {:error, reason} -> raise Glider.Error, message: reason, query: "changes.since"
+    Procedure.stream(
+      fn cursor ->
+        with {:ok, args, budget} <-
+               Procedure.split(Keyword.put(opts, :after, cursor), [:kinds, :limit, :after], ""),
+             :ok <- Procedure.positive(Keyword.get(args, :limit), "limit:"),
+             {:ok, a} <-
+               Procedure.sliced(
+                 db,
+                 "changes.since",
+                 [revision: revision] ++ args,
+                 [max_rows: @max_rows, probe: true] ++ budget
+               ) do
+          case answer(a, revision) do
+            {:ok, slice} -> {:ok, slice.changes, a.end}
+            {:error, _} -> {:ok, [], a.end |> Map.put(:message, a.message)}
           end
+        end
       end,
-      fn _ -> :ok end
+      fn e ->
+        raise Unanswerable,
+          revision: revision,
+          reason: e.reason,
+          oldest: e.oldest,
+          message: Map.get(e, :message)
+      end,
+      fn reason -> raise Glider.Error, message: reason, query: "changes.since" end
     )
   end
 
@@ -275,7 +315,8 @@ defmodule Glider.Changes do
   @doc """
   Forget the changes at or below `below`, raising the oldest revision the
   journal answers for to it. With `limit: n`, forget at most `n` entries in
-  this call; `more: true` says to call again.
+  this call; `more: true` says it stopped at that limit, so call again
+  (the next call may find nothing left to forget).
 
       {:ok, %{released: 1200, more: false}} = Glider.Changes.release(db, rev)
   """
@@ -284,7 +325,8 @@ defmodule Glider.Changes do
   def release(db, below, opts \\ []) when is_integer(below) and below >= 0 do
     with {:ok, args, budget} <- Procedure.split(opts, [:limit], "Glider.Changes.release/3"),
          {:ok, r} <- Procedure.call(db, "changes.release", [below: below] ++ args, budget) do
-      {:ok, %{released: r.touched, more: String.contains?(r.message || "", "more:")}}
+      limit = Keyword.get(args, :limit)
+      {:ok, %{released: r.touched, more: is_integer(limit) and r.touched >= limit}}
     end
   end
 
@@ -305,63 +347,6 @@ defmodule Glider.Changes do
   end
 
   # ------------------------------------------------------------------ private
-
-  defp slice(r) do
-    changes =
-      Enum.map(r.rows, fn [revision, kind, id, change] ->
-        %Change{revision: revision, kind: kind(kind), id: id, change: change(change)}
-      end)
-
-    message = r.message || ""
-
-    case Regex.run(~r/after: '([^']+)'/, message) do
-      [_, cursor] ->
-        %Slice{changes: changes, after: cursor, complete_up_to: nil}
-
-      nil ->
-        complete =
-          case Regex.run(~r/complete up to revision (\d+)/, message) do
-            [_, n] -> String.to_integer(n)
-            nil -> nil
-          end
-
-        %Slice{changes: changes, after: nil, complete_up_to: complete}
-    end
-  end
-
-  # The engine's refusals all begin this way; anything else (not installed,
-  # a bad argument) stays a string.
-  defp unanswerable(db, revision, "the change journal cannot answer" <> _ = message, budget) do
-    reason =
-      cond do
-        message =~ "past this database's" -> :restarting
-        message =~ ~r/: this database is at \d+/ -> :ahead
-        true -> :below_oldest
-      end
-
-    {oldest, why} =
-      case reason do
-        :restarting ->
-          {nil, nil}
-
-        _ ->
-          case status(db, budget) do
-            {:ok, s} -> {s.oldest, s.why}
-            {:error, _} -> {floor_in(message), nil}
-          end
-      end
-
-    %Unanswerable{revision: revision, oldest: oldest, reason: reason, why: why, message: message}
-  end
-
-  defp unanswerable(_db, _revision, reason, _budget), do: reason
-
-  defp floor_in(message) do
-    case Regex.run(~r/it answers for revision (\d+) and later/, message) do
-      [_, n] -> String.to_integer(n)
-      nil -> nil
-    end
-  end
 
   # Fixed vocabularies of the engine: mapped by table, never String.to_atom.
   defp kind("node"), do: :node

@@ -1,7 +1,7 @@
 defmodule Glider.Procedure do
   @moduledoc false
   # Running one engine statement for a typed wrapper (`Glider.Changes`,
-  # `Glider.Check`, `Glider.health/2`): arguments allow-listed and sent as
+  # `Glider.Check`, `Glider.Structure`, `Glider.health/2`): arguments allow-listed and sent as
   # `$` parameters, the statement budget and result caps passed through, and
   # a `[:glider, :query, ...]` span with the procedure named.
 
@@ -60,6 +60,161 @@ defmodule Glider.Procedure do
       end
     end)
   end
+
+  # ------------------------------------------------------------ answers in slices
+  #
+  # The one place that knows the end row (glider's docs/EXTENSIONS.md,
+  # "Answers in slices"): a procedure that answers a piece at a time ends its
+  # table with a `slice` column, null on every row but the last, whose value
+  # is a JSON object `answered, complete, next, reason, oldest, watermark`.
+  # Nothing here reads the message.
+
+  @reasons %{
+    "not_installed" => :not_installed,
+    "installed" => :installed,
+    "released" => :released,
+    "cap" => :cap,
+    "cleared" => :cleared,
+    "reset" => :reset,
+    "ahead" => :ahead,
+    "restarting" => :restarting
+  }
+
+  @doc false
+  # `call/4` for a procedure that ends with the end row: `{:ok, %{columns:,
+  # rows:, end:, message:, touched:}}` with the `slice` column and the end
+  # row taken off, `end` the end row read back as a map with atom keys
+  # (`reason` an atom of the engine's fixed set). A result without a
+  # well-formed end row is an error, never a complete answer.
+  def sliced(db, procedure, args, opts) do
+    with {:ok, r} <- call(db, procedure, args, opts), do: split_end(r, procedure)
+  end
+
+  @doc false
+  def split_end(%{columns: columns, rows: rows} = r, procedure) do
+    with {:ok, own} <- own_columns(columns, procedure),
+         {:ok, body, last} <- last_row(rows, procedure),
+         {:ok, end_} <- end_row(last, length(own), procedure) do
+      {:ok,
+       %{
+         columns: own,
+         rows: Enum.map(body, &Enum.take(&1, length(own))),
+         end: end_,
+         message: r.message,
+         touched: Map.get(r, :touched, 0)
+       }}
+    end
+  end
+
+  defp own_columns(columns, procedure) do
+    case Enum.split(columns, -1) do
+      {own, ["slice"]} -> {:ok, own}
+      _ -> {:error, "#{procedure} gave no slice column; this engine predates the end row"}
+    end
+  end
+
+  defp last_row([], procedure), do: {:error, "#{procedure} gave no end row"}
+
+  defp last_row(rows, _procedure) do
+    {body, [last]} = Enum.split(rows, -1)
+    {:ok, body, last}
+  end
+
+  defp end_row(last, own, procedure) do
+    {cells, [json]} = Enum.split(last, -1)
+
+    with true <- length(cells) == own and Enum.all?(cells, &is_nil/1) and is_binary(json),
+         %{"answered" => answered, "complete" => complete, "next" => next} = j
+         when is_boolean(answered) and is_boolean(complete) <- decode(json),
+         {:ok, reason} <- reason(Map.get(j, "reason")) do
+      {:ok,
+       %{
+         answered: answered,
+         complete: complete,
+         next: next,
+         reason: reason,
+         oldest: Map.get(j, "oldest"),
+         watermark: Map.get(j, "watermark")
+       }}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, "#{procedure} ended with a row that is not an end row: #{inspect(last)}"}
+    end
+  end
+
+  # JSON null as nil (`:json` decodes it to `:null`).
+  defp decode(json) do
+    json
+    |> :json.decode()
+    |> Map.new(fn {k, v} -> {k, if(v == :null, do: nil, else: v)} end)
+  rescue
+    _ -> nil
+  end
+
+  defp reason(nil), do: {:ok, nil}
+
+  defp reason(name) do
+    case Map.fetch(@reasons, name) do
+      {:ok, atom} -> {:ok, atom}
+      :error -> {:error, "the engine gave a reason this binding does not know: #{inspect(name)}"}
+    end
+  end
+
+  @doc false
+  # A lazy stream over slices: `fetch.(cursor)` (nil first) returns
+  # `{:ok, items, end}` or `{:error, reason}`; the stream follows the end
+  # row's `next` exactly as given, stops on `complete`, and calls
+  # `cannot.(end)` (which raises) when a slice says it cannot answer, on the
+  # first slice or any later one. A slice that is neither complete nor gives
+  # a next one is an error, never the end of the answer. `failed.(reason)`
+  # raises for any other failure.
+  def stream(fetch, cannot, failed) do
+    Stream.resource(
+      fn -> {:next, nil} end,
+      fn
+        :done ->
+          {:halt, :done}
+
+        {:next, cursor} ->
+          case fetch.(cursor) do
+            {:ok, _items, %{answered: false} = end_} ->
+              cannot.(end_)
+
+            {:ok, items, %{complete: true}} ->
+              {items, :done}
+
+            {:ok, items, %{next: next}} when not is_nil(next) ->
+              {items, {:next, next}}
+
+            {:ok, _items, end_} ->
+              failed.("a slice was neither complete nor said where to go on: #{inspect(end_)}")
+
+            {:error, reason} ->
+              failed.(reason)
+          end
+      end,
+      fn _ -> :ok end
+    )
+  end
+
+  @doc false
+  # Run `fun` (several statements) so that no other process writes between
+  # them: inside the caller's transaction as it is, otherwise in a
+  # transaction of its own, which `fun`'s read-only statements leave empty.
+  def together(db, fun) do
+    if Glider.in_transaction?(db) do
+      fun.()
+    else
+      case Glider.transaction(db, fun) do
+        {:ok, result} -> result
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  @doc false
+  # Rows as maps keyed by the engine's column names (binaries from data).
+  def maps(columns, rows), do: Enum.map(rows, &(columns |> Enum.zip(&1) |> Map.new()))
 
   @doc false
   # Split `opts` into the procedure's arguments (`allowed`) and the budget;
