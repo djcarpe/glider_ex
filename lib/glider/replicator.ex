@@ -62,8 +62,7 @@ defmodule Glider.Replicator do
   def status(server), do: GenServer.call(server, :status, :infinity)
 
   @doc "Run a pass now (with `force_snapshot: true` for a new base) and return its result."
-  @spec sync_now(GenServer.server(), keyword()) ::
-          {:ok, Replication.report()} | {:error, String.t()}
+  @spec sync_now(GenServer.server(), keyword()) :: {:ok, Replication.report()} | {:error, String.t()}
   def sync_now(server, opts \\ []), do: GenServer.call(server, {:sync_now, opts}, :infinity)
 
   @impl true
@@ -106,8 +105,7 @@ defmodule Glider.Replicator do
 
   @impl true
   def handle_call(:status, _from, state) do
-    {:reply, Map.take(state, [:path, :url, :passes, :errors, :last, :last_error, :last_at]),
-     state}
+    {:reply, Map.take(state, [:path, :url, :passes, :errors, :last, :last_error, :last_at]), state}
   end
 
   def handle_call({:sync_now, opts}, _from, state) do
@@ -124,10 +122,7 @@ defmodule Glider.Replicator do
         {result, %{state | last: report, last_error: nil}}
 
       {:error, reason} ->
-        Logger.warning(
-          "glider replication of #{state.path || "a memory graph"} to #{state.url}: #{reason} (retrying)"
-        )
-
+        Logger.warning("glider replication of #{state.path || "a memory graph"} to #{state.url}: #{reason} (retrying)")
         {result, %{state | errors: state.errors + 1, last_error: reason}}
     end
   end
@@ -135,14 +130,9 @@ defmodule Glider.Replicator do
   # A file by its path, or a memory graph by its handle.
   defp source(opts) do
     case {Keyword.get(opts, :path), Keyword.get(opts, :db)} do
-      {nil, nil} ->
-        raise ArgumentError, "Glider.Replicator needs :path, or :db for a memory graph"
-
-      {nil, db} ->
-        db
-
-      {path, _} ->
-        to_string(path)
+      {nil, nil} -> raise ArgumentError, "Glider.Replicator needs :path, or :db for a memory graph"
+      {nil, db} -> db
+      {path, _} -> to_string(path)
     end
   end
 end
